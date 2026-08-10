@@ -129,8 +129,18 @@ digest，Python 套件也鎖定確切版本。
 
 ```sh
 python -m pip install -r requirements-dev.txt
+pre-commit install
 pytest
 ```
+
+`pre-commit install` 會在本機 Git commit 前執行 Black。若要一次格式化並檢查
+所有 Python 檔案，可執行：
+
+```sh
+pre-commit run --all-files
+```
+
+CI 也會執行同一個 hook，因此未格式化的程式碼不會通過測試工作。
 
 正式程式採用 `src` package 佈局：
 

@@ -363,16 +363,16 @@ class TestCrawlRentList:
                 crawl_rent_list()
 
     def test_invalid_region_raises_before_http(self):
-        with mock.patch(
-            "rent591_notifier.crawler._http_get"
-        ) as mget, pytest.raises(ValueError):
+        with mock.patch("rent591_notifier.crawler._http_get") as mget, pytest.raises(
+            ValueError
+        ):
             crawl_rent_list(region="宇宙市")
         mget.assert_not_called()
 
     def test_invalid_section_raises_before_http(self):
-        with mock.patch(
-            "rent591_notifier.crawler._http_get"
-        ) as mget, pytest.raises(ValueError):
+        with mock.patch("rent591_notifier.crawler._http_get") as mget, pytest.raises(
+            ValueError
+        ):
             crawl_rent_list(region=3, sections="北屯區")
         mget.assert_not_called()
 

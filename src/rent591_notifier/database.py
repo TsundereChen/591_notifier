@@ -185,8 +185,7 @@ def _migrate_legacy_table(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE listings ADD COLUMN section TEXT")
         legacy_columns.add("section")
     if "location" in legacy_columns:
-        conn.execute(
-            """
+        conn.execute("""
             UPDATE listings
             SET section = CASE
                 WHEN instr(location, '-') > 0
@@ -194,8 +193,7 @@ def _migrate_legacy_table(conn: sqlite3.Connection) -> None:
                 ELSE location
             END
             WHERE section IS NULL AND location IS NOT NULL
-            """
-        )
+            """)
 
     region_names = [
         row[0] for row in conn.execute("SELECT DISTINCT region FROM listings")

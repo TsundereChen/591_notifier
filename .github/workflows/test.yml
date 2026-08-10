@@ -28,6 +28,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements-dev.txt
 
+      - name: Run Black pre-commit hook
+        if: matrix.python-version == '3.13'
+        run: pre-commit run --all-files
+
       # Integration tests hit the live 591 site; pytest.ini excludes them here.
       - name: Run unit tests
         run: pytest -v
