@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from config_store import ConfigStore
+from rent591_notifier.config_store import ConfigStore
 
 
 def test_store_bootstraps_and_persists_settings(tmp_path):

@@ -5,8 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import bot
-from bot import (
+from rent591_notifier import bot
+from rent591_notifier.bot import (
     _allowed_user_id,
     _authorized,
     _config_summary,
@@ -15,7 +15,7 @@ from bot import (
     _regions_view,
     enqueue_crawl,
 )
-from config_store import ConfigStore
+from rent591_notifier.config_store import ConfigStore
 
 
 def test_valid_cron_uses_configured_timezone():

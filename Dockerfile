@@ -2,6 +2,7 @@ FROM python:3.13-slim@sha256:9662417aace5ae7b8e2609cce472b72a8958e134ba372808abe
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src \
     CONFIG_PATH=/data/config.yaml \
     CONFIG_TEMPLATE_PATH=/app/config.yaml.example \
     DATABASE_PATH=/data/listings.db
@@ -16,9 +17,10 @@ RUN addgroup --system notifier \
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY crawler.py main.py config_store.py notifier.py bot.py config.yaml.example ./
+COPY src ./src
+COPY config.yaml.example ./
 
 USER notifier
 VOLUME ["/data"]
 
-CMD ["python", "bot.py"]
+CMD ["python", "-m", "rent591_notifier"]

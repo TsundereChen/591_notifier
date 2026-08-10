@@ -54,7 +54,9 @@ jobs:
       - name: Build amd64 smoke-test image
         run: docker build --platform linux/amd64 -t 591-notifier:test .
       - name: Import application in the container
-        run: docker run --rm --entrypoint python 591-notifier:test -c "import bot, crawler, main, notifier"
+        run: >-
+          docker run --rm --entrypoint python 591-notifier:test -c
+          "from rent591_notifier import bot, crawler, database, notifier"
 
   build:
     needs: [test, container-test]

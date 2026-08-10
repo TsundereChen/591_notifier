@@ -21,15 +21,15 @@ from telegram.ext import (
     filters,
 )
 
-from config_store import ConfigStore
-from crawler import KINDS, REGIONS, SECTIONS, _resolve_region, _validate_price_range
-from main import (
+from .config_store import ConfigStore
+from .crawler import KINDS, REGIONS, SECTIONS, _resolve_region, _validate_price_range
+from .database import (
     ambiguous_deliveries,
     init_db,
     resolve_ambiguous_delivery,
     resolve_database_path,
 )
-from notifier import crawl_and_notify
+from .notifier import crawl_and_notify
 
 LOGGER = logging.getLogger(__name__)
 CRAWL_JOB_NAME = "scheduled-crawl"

@@ -132,6 +132,24 @@ python -m pip install -r requirements-dev.txt
 pytest
 ```
 
+正式程式採用 `src` package 佈局：
+
+```text
+src/rent591_notifier/
+├── __main__.py       # `python -m rent591_notifier` 執行入口
+├── bot.py            # Telegram 指令、按鈕與排程
+├── config_store.py   # YAML 設定與單副本鎖
+├── crawler.py        # 591 HTTP 請求與頁面解析
+├── database.py       # SQLite schema、遷移與通知帳本
+└── notifier.py       # 爬取與通知流程協調
+```
+
+若要直接從原始碼啟動 bot，可使用：
+
+```sh
+PYTHONPATH=src python -m rent591_notifier
+```
+
 預設不執行會連線至 591 的整合測試；若要執行，請使用：
 
 ```sh

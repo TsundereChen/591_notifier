@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from main import (
+from rent591_notifier.database import (
     ambiguous_deliveries,
     delivery_status,
     init_db,

@@ -14,7 +14,7 @@ from typing import Any
 
 import yaml
 
-from crawler import (
+from .crawler import (
     KINDS,
     REGIONS,
     SECTIONS,

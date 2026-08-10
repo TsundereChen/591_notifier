@@ -15,7 +15,7 @@ import pytest
 import requests
 from bs4 import BeautifulSoup
 
-from crawler import (
+from rent591_notifier.crawler import (
     KINDS,
     REGIONS,
     SECTIONS,
@@ -283,7 +283,7 @@ def _mock_response(html):
 
 class TestCrawlRentList:
     def _crawl(self, **kwargs):
-        with mock.patch("crawler._http_get") as mget:
+        with mock.patch("rent591_notifier.crawler._http_get") as mget:
             mget.return_value = _mock_response(FIXTURE_HTML)
             result = json.loads(crawl_rent_list(**kwargs))
         return result, mget
@@ -357,25 +357,29 @@ class TestCrawlRentList:
             assert key in listing, key
 
     def test_http_error_propagates(self):
-        with mock.patch("crawler._http_get") as mget:
+        with mock.patch("rent591_notifier.crawler._http_get") as mget:
             mget.return_value.raise_for_status.side_effect = Exception("boom")
             with pytest.raises(Exception, match="boom"):
                 crawl_rent_list()
 
     def test_invalid_region_raises_before_http(self):
-        with mock.patch("crawler._http_get") as mget, pytest.raises(ValueError):
+        with mock.patch(
+            "rent591_notifier.crawler._http_get"
+        ) as mget, pytest.raises(ValueError):
             crawl_rent_list(region="宇宙市")
         mget.assert_not_called()
 
     def test_invalid_section_raises_before_http(self):
-        with mock.patch("crawler._http_get") as mget, pytest.raises(ValueError):
+        with mock.patch(
+            "rent591_notifier.crawler._http_get"
+        ) as mget, pytest.raises(ValueError):
             crawl_rent_list(region=3, sections="北屯區")
         mget.assert_not_called()
 
     def test_unrecognizable_success_page_is_rejected(self):
         with (
             mock.patch(
-                "crawler._http_get",
+                "rent591_notifier.crawler._http_get",
                 return_value=_mock_response("<html>challenge</html>"),
             ),
             pytest.raises(CrawlerParseError, match="listing container"),
@@ -388,7 +392,9 @@ class TestCrawlRentList:
             '<div class="item" data-id="broken"></div><div class="item" data-id="21803880">',
             1,
         )
-        with mock.patch("crawler._http_get", return_value=_mock_response(html)):
+        with mock.patch(
+            "rent591_notifier.crawler._http_get", return_value=_mock_response(html)
+        ):
             result = json.loads(crawl_rent_list())
         assert result["count"] == 3
         assert result["parse_error_count"] == 1
@@ -403,7 +409,7 @@ class TestCrawlRentList:
         session = mock.Mock()
         session.get.return_value = redirect
         with (
-            mock.patch("crawler._http_session", return_value=session),
+            mock.patch("rent591_notifier.crawler._http_session", return_value=session),
             pytest.raises(ValueError, match="must stay on"),
         ):
             _http_get("https://rent.591.com.tw/1", timeout=1)
@@ -491,7 +497,7 @@ class TestParseDetail:
 
 class TestCrawlRentDetails:
     def _crawl(self, arg, **kwargs):
-        with mock.patch("crawler._http_get") as mget:
+        with mock.patch("rent591_notifier.crawler._http_get") as mget:
             mget.return_value = _mock_response(DETAIL_FIXTURE_HTML)
             result = json.loads(crawl_rent_details(arg, **kwargs))
         return result, mget
@@ -505,7 +511,7 @@ class TestCrawlRentDetails:
 
     def test_list_of_urls(self):
         urls = ["https://rent.591.com.tw/1", "https://rent.591.com.tw/2"]
-        with mock.patch("crawler.time.sleep") as msleep:
+        with mock.patch("rent591_notifier.crawler.time.sleep") as msleep:
             result, mget = self._crawl(urls)
         assert result["count"] == 2
         assert mget.call_count == 2
@@ -513,7 +519,7 @@ class TestCrawlRentDetails:
         msleep.assert_called_once_with(0.5)
 
     def test_failed_url_yields_error_entry(self):
-        with mock.patch("crawler._http_get") as mget:
+        with mock.patch("rent591_notifier.crawler._http_get") as mget:
             ok = _mock_response(DETAIL_FIXTURE_HTML)
             bad = mock.Mock()
             bad.raise_for_status.side_effect = requests.HTTPError("404")
@@ -537,7 +543,7 @@ class TestCrawlRentDetails:
         ],
     )
     def test_rejects_untrusted_detail_urls_before_http(self, url):
-        with mock.patch("crawler._http_get") as mget:
+        with mock.patch("rent591_notifier.crawler._http_get") as mget:
             result = json.loads(crawl_rent_details(url, delay=0))
         assert "error" in result["listings"][0]
         mget.assert_not_called()

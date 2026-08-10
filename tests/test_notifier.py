@@ -6,8 +6,13 @@ from unittest import mock
 
 import pytest
 
-from main import delivery_status, init_db, insert_notified_listing, listing_exists
-from notifier import MAX_RESULTS_PER_REGION, crawl_and_notify
+from rent591_notifier.database import (
+    delivery_status,
+    init_db,
+    insert_notified_listing,
+    listing_exists,
+)
+from rent591_notifier.notifier import MAX_RESULTS_PER_REGION, crawl_and_notify
 
 
 def write_config(tmp_path, crawl):
@@ -50,7 +55,9 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
             raise RuntimeError("Telegram unavailable")
 
     response = payload("新北市", [listing("old"), listing("new"), listing("failed")])
-    with mock.patch("notifier.crawl_rent_list", return_value=response):
+    with mock.patch(
+        "rent591_notifier.notifier.crawl_rent_list", return_value=response
+    ):
         summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
 
     assert notifications == ["new", "failed"]
@@ -73,7 +80,9 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
     async def retry(_, item):
         retried.append(item["id"])
 
-    with mock.patch("notifier.crawl_rent_list", return_value=response):
+    with mock.patch(
+        "rent591_notifier.notifier.crawl_rent_list", return_value=response
+    ):
         second = await crawl_and_notify(config_path, retry, run_in_thread=False)
     assert retried == []
     assert second["notified"] == 0
@@ -94,7 +103,7 @@ async def test_maximum_thirty_results_per_county(tmp_path):
         notified.append(item["id"])
 
     with mock.patch(
-        "notifier.crawl_rent_list",
+        "rent591_notifier.notifier.crawl_rent_list",
         return_value=payload("新北市", first),
     ) as crawl:
         summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
@@ -125,7 +134,9 @@ async def test_duplicate_result_within_page_is_considered_once(tmp_path):
         notified.append(item["id"])
 
     response = payload("新北市", [listing("same"), listing("same")])
-    with mock.patch("notifier.crawl_rent_list", return_value=response):
+    with mock.patch(
+        "rent591_notifier.notifier.crawl_rent_list", return_value=response
+    ):
         await crawl_and_notify(config_path, notify, run_in_thread=False)
 
     assert notified == ["same"]
@@ -142,9 +153,11 @@ async def test_send_then_database_failure_is_never_automatically_resent(tmp_path
         return {"chat_id": 123, "message_id": 456}
 
     with (
-        mock.patch("notifier.crawl_rent_list", return_value=response),
         mock.patch(
-            "notifier.insert_notified_listing",
+            "rent591_notifier.notifier.crawl_rent_list", return_value=response
+        ),
+        mock.patch(
+            "rent591_notifier.notifier.insert_notified_listing",
             side_effect=sqlite3.OperationalError("disk full"),
         ),
     ):
@@ -154,7 +167,9 @@ async def test_send_then_database_failure_is_never_automatically_resent(tmp_path
     assert first["ambiguous"] == 1
     assert sent == ["uncertain"]
 
-    with mock.patch("notifier.crawl_rent_list", return_value=response):
+    with mock.patch(
+        "rent591_notifier.notifier.crawl_rent_list", return_value=response
+    ):
         second = await crawl_and_notify(config_path, notify, run_in_thread=False)
     assert second["ambiguous"] == 1
     assert sent == ["uncertain"]
@@ -173,7 +188,9 @@ async def test_telegram_receipt_is_persisted(tmp_path):
     async def notify(_, __):
         return {"chat_id": 123, "message_id": 456}
 
-    with mock.patch("notifier.crawl_rent_list", return_value=response):
+    with mock.patch(
+        "rent591_notifier.notifier.crawl_rent_list", return_value=response
+    ):
         await crawl_and_notify(config_path, notify, run_in_thread=False)
 
     conn = sqlite3.connect(db_path)

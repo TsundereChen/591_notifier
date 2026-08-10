@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from crawler import (
+from .crawler import (
     REGIONS,
     _resolve_kinds,
     _resolve_region,

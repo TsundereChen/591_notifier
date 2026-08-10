@@ -9,8 +9,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from crawler import crawl_rent_list
-from main import (
+from .crawler import crawl_rent_list
+from .database import (
     init_db,
     insert_notified_listing,
     load_config,
