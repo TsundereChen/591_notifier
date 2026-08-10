@@ -1,0 +1,28 @@
+# 591 爬蟲設定。
+#
+# database：SQLite 資料庫路徑（預設為 listings.db）。
+# crawl：   要爬取的縣市清單。每一筆都必須包含 region（縣市）；
+#           sections（鄉鎮市區）可省略，省略時代表整個縣市；
+#           kinds 與 price 也可省略，省略時代表不限類型／租金。
+# 機器人固定只檢查第一頁，且每次執行時每個縣市最多處理 30 筆結果。
+
+database: listings.db
+schedule: "*/15 * * * *"
+timezone: Asia/Taipei
+
+# 第一位允許的使用者傳送 /start 後，機器人會自動填入下列綁定資料。
+telegram:
+  owner_user_id:
+  chat_id:
+
+crawl:
+  - region: 新北市
+    sections:
+      - 土城區
+      - 中和區
+    kinds: []  # 例如：[整層住家, 獨立套房]；空陣列代表不限類型。
+    price: {}  # 例如：{min: 10000, max: 30000}；空物件代表不限租金。
+  - region: 台北市
+    sections: []
+    kinds: []
+    price: {}

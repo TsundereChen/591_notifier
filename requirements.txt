@@ -1,0 +1,5 @@
+requests
+beautifulsoup4
+pyyaml
+python-telegram-bot[job-queue]~=22.8
+truststore; sys_platform == "darwin"
