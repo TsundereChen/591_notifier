@@ -1,4 +1,4 @@
-"""用於設定與執行 591 租屋通知服務的互動式 Telegram 機器人。"""
+"""Interactive Telegram bot for configuring and running the 591 notifier."""
 
 import asyncio
 import logging

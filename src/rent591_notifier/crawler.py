@@ -111,8 +111,8 @@ def _validate_detail_url(url):
     return url
 
 
-# Region (縣市) ids and per-region section (鄉鎮市區) ids, as used by the site's
-# own frontend data. Section names are only unique within their region.
+# Region and district IDs from 591's `縣市` and `鄉鎮市區` frontend data.
+# District names are only unique within their region.
 REGIONS = {
     1: "台北市",
     2: "基隆市",
@@ -665,12 +665,13 @@ def _parse_spec(spans):
     for frag in spans:
         if "坪" in frag:
             spec["area"] = frag
-        elif re.match(r"^\d+\s*房", frag):  # e.g. "4房2廳2衛"
+        elif re.match(r"^\d+\s*房", frag):  # Example 591 layout: `4房2廳2衛`.
             spec["layout"] = frag
         elif "F" in frag or "樓" in frag:
             spec["floor"] = frag
         elif not spec["kind"]:
-            spec["kind"] = frag  # e.g. 整層住家 / 獨立套房 / 雅房
+            # Example 591 item types: `整層住家`, `獨立套房`, and `雅房`.
+            spec["kind"] = frag
     return spec
 
 
@@ -719,7 +720,7 @@ def _parse_item(item):
         elif "house-home" in icon_class:
             listing.update(_parse_spec(spans))
         elif "house-place" in icon_class:
-            # May include a community name followed by "區-路" address fragment.
+            # May include a community name followed by a district-road fragment.
             listing["community"] = spans[0] if len(spans) > 1 else ""
             listing["location"] = spans[-1] if spans else ""
         elif "house-metro" in icon_class or "house-bus-line" in icon_class:
@@ -855,7 +856,7 @@ def _parse_detail(soup, url):
         _text(s) for s in board.select("div.house-label span.label-item")
     ]
 
-    # Pattern line: layout / area / floor / building type (e.g. 公寓、透天).
+    # Pattern line: layout / area / floor / building type, such as `公寓` or `透天`.
     spans = [_text(s) for s in board.select("div.pattern > span") if _text(s)]
     spec = _parse_spec(spans)
     detail["layout"] = spec["layout"]
@@ -871,7 +872,7 @@ def _parse_detail(soup, url):
 
     detail["address"] = _text(soup.select_one("div.address span.load-map"))
 
-    # 房屋詳情: grouped label/value sections such as 基礎資料、房屋價格.
+    # Parse `房屋詳情` label/value groups such as `基礎資料` and `房屋價格`.
     details = {}
     for section in soup.select("section.detail-section"):
         name = _text(section.select_one("span.section-name"))
@@ -880,7 +881,7 @@ def _parse_detail(soup, url):
             details[name] = pairs
     detail["details"] = details
 
-    # 租住說明: 最短租期 / 身份要求 / 養寵物 ...
+    # Parse `租住說明` fields such as `最短租期`, `身份要求`, and `養寵物`.
     service = soup.select_one("section.block.service")
     detail["rental_notes"] = (
         _label_value_pairs(
@@ -890,7 +891,7 @@ def _parse_detail(soup, url):
         else {}
     )
 
-    # 提供設備/家具: <dl class="del"> marks items NOT provided.
+    # In `提供設備/家具`, <dl class="del"> marks items that are not provided.
     provided, not_provided = [], []
     for dl in soup.select("div.facility dl"):
         name = _text(dl.select_one("dd"))

@@ -96,16 +96,16 @@ class TestResolveSections:
         assert _resolve_sections(3, [39, "中和區"]) == [39, 38]
 
     def test_ambiguous_names_resolve_within_region(self):
-        # "東區" exists in several cities; each region resolves its own.
-        assert _resolve_sections(4, "東區") == [371]  # 新竹市
-        assert _resolve_sections(8, "東區") == [99]  # 台中市
+        # The label `東區` exists in several cities; each region resolves its own.
+        assert _resolve_sections(4, "東區") == [371]  # Expected ID for 新竹市.
+        assert _resolve_sections(8, "東區") == [99]  # Expected ID for 台中市.
 
     def test_unknown_name_raises(self):
         with pytest.raises(ValueError, match="unknown section '火星區'"):
             _resolve_sections(3, "火星區")
 
     def test_section_from_wrong_region_raises(self):
-        # 北屯區 belongs to 台中市, not 新北市.
+        # `北屯區` belongs to `台中市`, not `新北市`.
         with pytest.raises(ValueError, match="unknown section '北屯區'"):
             _resolve_sections(3, "北屯區")
 
@@ -176,7 +176,7 @@ class TestParseSpec:
         }
 
     def test_suite_has_no_layout(self):
-        # 獨立套房 is the kind, not a layout.
+        # `獨立套房` is the listing kind, not a layout.
         spec = _parse_spec(["獨立套房", "4坪", "2F/4F"])
         assert spec == {
             "kind": "獨立套房",
