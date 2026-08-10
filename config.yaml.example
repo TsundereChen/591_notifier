@@ -10,7 +10,8 @@ database: listings.db
 schedule: "*/15 * * * *"
 timezone: Asia/Taipei
 
-# 第一位允許的使用者傳送 /start 後，機器人會自動填入下列綁定資料。
+# TELEGRAM_ALLOWED_USER_ID 指定的使用者在私聊傳送 /start 後，機器人會填入
+# 下列綁定資料。通知聊天室一旦綁定便不會因其他聊天室的操作而自動變更。
 telegram:
   owner_user_id:
   chat_id:

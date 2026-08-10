@@ -1,5 +1,9 @@
 """Tests for Telegram-managed YAML persistence."""
 
+import os
+
+import pytest
+
 from config_store import ConfigStore
 
 
@@ -76,3 +80,51 @@ def test_old_pages_option_is_removed(tmp_path):
 
     assert "pages" not in data["crawl"][0]
     assert data["crawl"][0]["sections"] == []
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        ("[]\n", "root must be"),
+        ("crawl: nope\n", "must be a list"),
+        ("crawl: [nope]\n", "must be a mapping"),
+        ("crawl: [{region: 新北市}, {region: 3}]\n", "duplicate crawl region"),
+    ],
+)
+def test_invalid_existing_config_fails_without_overwriting(tmp_path, text, message):
+    path = tmp_path / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        ConfigStore(path)
+
+    assert path.read_text(encoding="utf-8") == text
+
+
+def test_owner_binding_is_pinned(tmp_path):
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.bind_owner(123, 123)
+    store.bind_owner(123, 123)
+
+    with pytest.raises(PermissionError, match="pinned"):
+        store.bind_owner(123, 456)
+    assert store.load()["telegram"] == {"owner_user_id": 123, "chat_id": 123}
+
+
+def test_runtime_config_permissions_are_private(tmp_path):
+    path = tmp_path / "config.yaml"
+    ConfigStore(path)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+def test_instance_lock_rejects_second_process_lock(tmp_path):
+    store = ConfigStore(tmp_path / "config.yaml")
+    first = store.acquire_instance_lock()
+    try:
+        with pytest.raises(RuntimeError, match="單一執行個體"):
+            store.acquire_instance_lock()
+    finally:
+        first.close()
+
+    second = store.acquire_instance_lock()
+    second.close()

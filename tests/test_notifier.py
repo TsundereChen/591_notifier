@@ -6,7 +6,7 @@ from unittest import mock
 
 import pytest
 
-from main import init_db, insert_notified_listing, listing_exists
+from main import delivery_status, init_db, insert_notified_listing, listing_exists
 from notifier import MAX_RESULTS_PER_REGION, crawl_and_notify
 
 
@@ -36,7 +36,7 @@ def listing(listing_id):
 
 
 @pytest.mark.asyncio
-async def test_store_only_after_successful_notification_and_retry_failures(tmp_path):
+async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_path):
     config_path, db_path = write_config(tmp_path, "  - region: 新北市\n")
     conn = init_db(db_path, [3])
     insert_notified_listing(conn, listing("old"), 3, "before")
@@ -54,10 +54,18 @@ async def test_store_only_after_successful_notification_and_retry_failures(tmp_p
         summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
 
     assert notifications == ["new", "failed"]
-    assert summary == {"fetched": 3, "notified": 1, "skipped": 1, "failed": 1}
+    assert summary == {
+        "fetched": 3,
+        "notified": 1,
+        "skipped": 1,
+        "failed": 1,
+        "ambiguous": 1,
+        "parse_failed": 0,
+    }
     conn = init_db(db_path)
     assert listing_exists(conn, 3, "new")
     assert not listing_exists(conn, 3, "failed")
+    assert delivery_status(conn, 3, "failed") == "ambiguous"
     conn.close()
 
     retried = []
@@ -67,20 +75,19 @@ async def test_store_only_after_successful_notification_and_retry_failures(tmp_p
 
     with mock.patch("notifier.crawl_rent_list", return_value=response):
         second = await crawl_and_notify(config_path, retry, run_in_thread=False)
-    assert retried == ["failed"]
-    assert second["notified"] == 1
+    assert retried == []
+    assert second["notified"] == 0
     assert second["skipped"] == 2
+    assert second["ambiguous"] == 1
 
 
 @pytest.mark.asyncio
-async def test_maximum_thirty_results_across_jobs_for_same_county(tmp_path):
+async def test_maximum_thirty_results_per_county(tmp_path):
     config_path, db_path = write_config(
         tmp_path,
-        "  - region: 新北市\n    sections: [土城區]\n"
-        "  - region: 新北市\n    sections: [中和區]\n",
+        "  - region: 新北市\n    sections: [土城區, 中和區]\n",
     )
-    first = [listing(f"a{i}") for i in range(20)]
-    second = [listing(f"b{i}") for i in range(20)]
+    first = [listing(f"a{i}") for i in range(40)]
     notified = []
 
     async def notify(_, item):
@@ -88,11 +95,11 @@ async def test_maximum_thirty_results_across_jobs_for_same_county(tmp_path):
 
     with mock.patch(
         "notifier.crawl_rent_list",
-        side_effect=[payload("新北市", first), payload("新北市", second)],
+        return_value=payload("新北市", first),
     ) as crawl:
         summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
 
-    assert crawl.call_count == 2
+    assert crawl.call_count == 1
     assert len(notified) == MAX_RESULTS_PER_REGION == 30
     assert summary["fetched"] == 30
     conn = sqlite3.connect(db_path)
@@ -106,11 +113,10 @@ async def test_maximum_thirty_results_across_jobs_for_same_county(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_result_across_jobs_is_considered_once(tmp_path):
+async def test_duplicate_result_within_page_is_considered_once(tmp_path):
     config_path, _ = write_config(
         tmp_path,
-        "  - region: 新北市\n    sections: [土城區]\n"
-        "  - region: 新北市\n    sections: [中和區]\n",
+        "  - region: 新北市\n    sections: [土城區, 中和區]\n",
     )
     response = payload("新北市", [listing("same")])
     notified = []
@@ -118,7 +124,62 @@ async def test_duplicate_result_across_jobs_is_considered_once(tmp_path):
     async def notify(_, item):
         notified.append(item["id"])
 
-    with mock.patch("notifier.crawl_rent_list", side_effect=[response, response]):
+    response = payload("新北市", [listing("same"), listing("same")])
+    with mock.patch("notifier.crawl_rent_list", return_value=response):
         await crawl_and_notify(config_path, notify, run_in_thread=False)
 
     assert notified == ["same"]
+
+
+@pytest.mark.asyncio
+async def test_send_then_database_failure_is_never_automatically_resent(tmp_path):
+    config_path, db_path = write_config(tmp_path, "  - region: 新北市\n")
+    response = payload("新北市", [listing("uncertain")])
+    sent = []
+
+    async def notify(_, item):
+        sent.append(item["id"])
+        return {"chat_id": 123, "message_id": 456}
+
+    with (
+        mock.patch("notifier.crawl_rent_list", return_value=response),
+        mock.patch(
+            "notifier.insert_notified_listing",
+            side_effect=sqlite3.OperationalError("disk full"),
+        ),
+    ):
+        first = await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    assert first["failed"] == 1
+    assert first["ambiguous"] == 1
+    assert sent == ["uncertain"]
+
+    with mock.patch("notifier.crawl_rent_list", return_value=response):
+        second = await crawl_and_notify(config_path, notify, run_in_thread=False)
+    assert second["ambiguous"] == 1
+    assert sent == ["uncertain"]
+
+    conn = init_db(db_path)
+    assert delivery_status(conn, 3, "uncertain") == "ambiguous"
+    assert not listing_exists(conn, 3, "uncertain")
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_receipt_is_persisted(tmp_path):
+    config_path, db_path = write_config(tmp_path, "  - region: 新北市\n")
+    response = payload("新北市", [listing("receipt")])
+
+    async def notify(_, __):
+        return {"chat_id": 123, "message_id": 456}
+
+    with mock.patch("notifier.crawl_rent_list", return_value=response):
+        await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT notification_status, telegram_chat_id, telegram_message_id "
+        "FROM 'listings_新北市' WHERE id = 'receipt'"
+    ).fetchone()
+    conn.close()
+    assert row == ("sent", 123, 456)

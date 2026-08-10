@@ -1,11 +1,19 @@
 """Offline tests for YAML-driven crawls and SQLite persistence."""
 
 import sqlite3
-from pathlib import Path
 
 import pytest
 
-from main import init_db, insert_notified_listing, listing_exists, load_config
+from main import (
+    ambiguous_deliveries,
+    delivery_status,
+    init_db,
+    insert_notified_listing,
+    listing_exists,
+    load_config,
+    reserve_delivery,
+    resolve_ambiguous_delivery,
+)
 
 
 def write_config(tmp_path, text):
@@ -33,7 +41,7 @@ crawl:
         cfg = load_config(path)
 
         assert cfg == {
-            "database": "data/rent.db",
+            "database": str((tmp_path / "data" / "rent.db").resolve()),
             "jobs": [
                 {
                     "region_id": 3,
@@ -61,6 +69,10 @@ crawl:
             ("crawl: [{region: 新北市, price: [1, 2]}]\n", "must define"),
             ("crawl: [{region: 新北市, price: {min: 2, max: 1}}]\n", "greater"),
             ("database: ''\ncrawl: [{region: 新北市}]\n", "non-empty path"),
+            (
+                "crawl: [{region: 新北市}, {region: 3}]\n",
+                "duplicate crawl region",
+            ),
         ],
     )
     def test_invalid_config(self, tmp_path, text, message):
@@ -104,13 +116,23 @@ class TestDatabase:
         old_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'listings'"
         ).fetchone()
-        conn.close()
 
-        assert "section" in columns
+        assert {"section", "notification_status", "notified_at"} <= columns
         assert section == "土城區"
         assert old_table is None
+        assert not listing_exists(conn, "新北市", "123")
+        assert reserve_delivery(conn, "新北市", "123", "review") == "ambiguous"
+        assert resolve_ambiguous_delivery(
+            conn, "新北市", "123", delivered=False, now="retry"
+        )
+        assert reserve_delivery(conn, "新北市", "123", "after-retry") == "reserved"
 
-    def test_notified_insert_deduplicates_without_updating(self):
+        listing = {"id": "123", "title": "A listing", "location": "土城區-中央路"}
+        assert insert_notified_listing(conn, listing, "新北市", "after")
+        assert listing_exists(conn, "新北市", "123")
+        conn.close()
+
+    def test_notified_insert_deduplicates_and_refreshes_metadata(self):
         conn = init_db(":memory:")
         listing = {
             "id": "123",
@@ -122,7 +144,9 @@ class TestDatabase:
         assert insert_notified_listing(conn, listing, "新北市", "2026-01-01T00:00:00")
         listing["title"] = "Updated title"
         listing["price_value"] = 12000
-        assert not insert_notified_listing(conn, listing, "新北市", "2026-01-02T00:00:00")
+        assert not insert_notified_listing(
+            conn, listing, "新北市", "2026-01-02T00:00:00"
+        )
         assert listing_exists(conn, "新北市", "123")
 
         row = conn.execute(
@@ -131,10 +155,73 @@ class TestDatabase:
         ).fetchone()
         conn.close()
         assert row == (
-            "First title",
-            10000,
+            "Updated title",
+            12000,
             "新北市",
             "土城區",
             "2026-01-01T00:00:00",
-            "2026-01-01T00:00:00",
+            "2026-01-02T00:00:00",
         )
+
+    def test_interrupted_delivery_becomes_ambiguous_and_is_not_reserved_again(self):
+        conn = init_db(":memory:", [3])
+        assert reserve_delivery(conn, 3, "123", "first") == "reserved"
+        assert reserve_delivery(conn, 3, "123", "second") == "ambiguous"
+        assert reserve_delivery(conn, 3, "123", "third") == "ambiguous"
+        assert delivery_status(conn, 3, "123") == "ambiguous"
+        assert ambiguous_deliveries(conn)[0]["listing_id"] == "123"
+        assert resolve_ambiguous_delivery(conn, 3, "123", delivered=False, now="fourth")
+        assert reserve_delivery(conn, 3, "123", "fifth") == "reserved"
+        conn.close()
+
+    def test_owner_can_resolve_ambiguous_as_already_delivered(self):
+        conn = init_db(":memory:", [3])
+        assert reserve_delivery(conn, 3, "123", "first") == "reserved"
+        assert reserve_delivery(conn, 3, "123", "second") == "ambiguous"
+        assert resolve_ambiguous_delivery(conn, 3, "123", delivered=True, now="third")
+        assert reserve_delivery(conn, 3, "123", "fourth") == "sent"
+        conn.close()
+
+    def test_owner_marks_legacy_unknown_row_as_delivered(self):
+        conn = init_db(":memory:", [3])
+        conn.execute(
+            'INSERT INTO "listings_新北市" '
+            "(id, first_seen, last_seen, notification_status) "
+            "VALUES ('123', 'old', 'old', 'unknown')"
+        )
+        conn.commit()
+
+        assert reserve_delivery(conn, 3, "123", "first") == "ambiguous"
+        assert resolve_ambiguous_delivery(conn, 3, "123", delivered=True, now="second")
+        assert listing_exists(conn, 3, "123")
+        assert reserve_delivery(conn, 3, "123", "third") == "sent"
+        conn.close()
+
+    def test_legacy_conflict_preserves_combined_table(self, tmp_path):
+        db_path = tmp_path / "conflict.db"
+        conn = init_db(db_path, [3])
+        insert_notified_listing(
+            conn,
+            {"id": "123", "title": "target", "location": "土城區-中央路"},
+            3,
+            "now",
+        )
+        conn.execute(
+            "CREATE TABLE listings (id TEXT PRIMARY KEY, title TEXT, location TEXT, "
+            "region TEXT, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO listings VALUES "
+            "('123', 'different', '土城區-中央路', '新北市', 'old', 'old')"
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(RuntimeError, match="legacy migration conflict"):
+            init_db(db_path)
+
+        check = sqlite3.connect(db_path)
+        assert check.execute(
+            "SELECT title FROM listings WHERE id = '123'"
+        ).fetchone() == ("different",)
+        check.close()

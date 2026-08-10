@@ -1,12 +1,16 @@
 """Crawl 591 rent listing pages (server-side rendered) and return listings as JSON."""
 
 import json
+import logging
 import re
+import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     # Use the OS trust store (fixes CERTIFICATE_VERIFY_FAILED with some
@@ -18,6 +22,9 @@ except ImportError:
     pass
 
 BASE_URL = "https://rent.591.com.tw/list"
+ALLOWED_DETAIL_HOST = "rent.591.com.tw"
+LOGGER = logging.getLogger(__name__)
+_THREAD_LOCAL = threading.local()
 
 HEADERS = {
     "User-Agent": (
@@ -27,6 +34,81 @@ HEADERS = {
     ),
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
 }
+
+
+class CrawlerParseError(RuntimeError):
+    """Raised when a successful HTTP response is not a recognizable list page."""
+
+
+def _http_session():
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            status=2,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _THREAD_LOCAL.session = session
+    return session
+
+
+def _http_get(url, *, timeout):
+    current = url
+    for _ in range(4):
+        parsed = urlparse(current)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != ALLOWED_DETAIL_HOST
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in (None, 443)
+        ):
+            raise ValueError(f"request URL must stay on https://{ALLOWED_DETAIL_HOST}")
+        response = _http_session().get(
+            current,
+            headers=HEADERS,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if response.is_redirect or response.is_permanent_redirect:
+            location = response.headers.get("location")
+            if not location:
+                return response
+            current = urljoin(current, location)
+            continue
+        return response
+    raise requests.TooManyRedirects("too many redirects from 591")
+
+
+def _validate_detail_url(url):
+    if not isinstance(url, str):
+        raise ValueError("detail URL must be a string")
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("detail URL has an invalid port") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != ALLOWED_DETAIL_HOST
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+    ):
+        raise ValueError(f"detail URL must use https://{ALLOWED_DETAIL_HOST}")
+    if not re.fullmatch(r"/\d+/?", parsed.path):
+        raise ValueError("detail URL path must contain a numeric listing id")
+    return url
 
 # Region (縣市) ids and per-region section (鄉鎮市區) ids, as used by the site's
 # own frontend data. Section names are only unique within their region.
@@ -93,6 +175,8 @@ KINDS = {
 
 def _resolve_region(region):
     """Resolve a region id or name (3 or "新北市") to its numeric id."""
+    if isinstance(region, bool):
+        raise ValueError("region must be an id or name, not a boolean")
     if isinstance(region, str) and not region.isdigit():
         for rid, name in REGIONS.items():
             if name == region:
@@ -115,6 +199,8 @@ def _resolve_sections(region_id, sections):
     valid = SECTIONS.get(region_id, {})
     ids = []
     for s in sections:
+        if isinstance(s, bool):
+            raise ValueError("section must be an id or name, not a boolean")
         if isinstance(s, str) and not s.isdigit():
             sid = next((k for k, v in valid.items() if v == s), None)
             if sid is None:
@@ -144,6 +230,8 @@ def _resolve_kinds(kinds):
 
     ids = []
     for kind in kinds:
+        if isinstance(kind, bool):
+            raise ValueError("listing kind must be an id or name, not a boolean")
         if isinstance(kind, str) and not kind.isdigit():
             kind_id = next((key for key, value in KINDS.items() if value == kind), None)
             if kind_id is None:
@@ -205,8 +293,12 @@ def _parse_item(item):
     listing = {"id": item.get("data-id")}
 
     title_a = item.select_one("div.item-info-title a.link")
+    if title_a is None:
+        raise ValueError(f"listing {listing['id']} has no title link")
     listing["title"] = title_a.get("title") or _text(title_a)
-    listing["url"] = title_a.get("href") if title_a else ""
+    listing["url"] = title_a.get("href") or ""
+    if not listing["title"] or not listing["url"]:
+        raise ValueError(f"listing {listing['id']} has an incomplete title link")
 
     img = item.select_one("div.item-img img")
     # Lazy-loaded images keep an inline SVG placeholder in `src`.
@@ -218,7 +310,8 @@ def _parse_item(item):
     price_node = item.select_one("div.item-info-price")
     listing["price"] = _text(price_node)
     strong = price_node.select_one("strong") if price_node else None
-    listing["price_value"] = int(_text(strong).replace(",", "")) if strong and _text(strong).replace(",", "").isdigit() else None
+    price_digits = _text(strong).replace(",", "")
+    listing["price_value"] = int(price_digits) if price_digits.isdigit() else None
 
     listing["tags"] = [_text(t) for t in item.select("div.item-info-tag span.tag")]
     preferred = item.select_one("div.item-info-title span.tag")
@@ -298,15 +391,41 @@ def crawl_rent_list(
         params["page"] = int(page)
     url = f"{BASE_URL}?{urlencode(params)}"
 
-    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+    resp = _http_get(url, timeout=timeout)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    listings = [
-        _parse_item(item)
-        for item in soup.select("div.item[data-id]")
-        if item.get("data-id")
+    # The saved fixture uses the legacy id while the current Nuxt page uses
+    # .list-wrapper. Requiring one of these prevents challenge/login HTML from
+    # being mistaken for a valid empty result.
+    container = soup.select_one("#list-container, .list-wrapper")
+    if container is None:
+        raise CrawlerParseError(
+            "591 response did not contain the expected listing container"
+        )
+    cards = [
+        item for item in container.select("div.item[data-id]") if item.get("data-id")
     ]
+    listings = []
+    parse_errors = []
+    for item in cards:
+        try:
+            listings.append(_parse_item(item))
+        except (AttributeError, TypeError, ValueError) as exc:
+            listing_id = str(item.get("data-id") or "unknown")
+            parse_errors.append({"id": listing_id, "error": str(exc)})
+            LOGGER.warning("Skipping malformed 591 listing %s: %s", listing_id, exc)
+    if cards and not listings:
+        raise CrawlerParseError(
+            f"all {len(cards)} listing cards failed to parse; site markup may have changed"
+        )
+    if not cards:
+        page_text = soup.get_text(" ", strip=True)
+        empty_markers = ("查無符合", "沒有符合", "暫無符合", "沒有相關物件")
+        if not any(marker in page_text for marker in empty_markers):
+            raise CrawlerParseError(
+                "listing container had no cards and no recognized empty-result message"
+            )
 
     return json.dumps(
         {
@@ -316,6 +435,8 @@ def crawl_rent_list(
             "kinds": [KINDS[kind_id] for kind_id in kind_ids],
             "price": {"min": price_min, "max": price_max},
             "count": len(listings),
+            "parse_error_count": len(parse_errors),
+            "parse_errors": parse_errors,
             "listings": listings,
         },
         ensure_ascii=False,
@@ -436,15 +557,23 @@ def crawl_rent_details(urls, timeout=30, delay=0.5):
         urls = [urls]
 
     listings = []
-    for i, url in enumerate(urls):
-        if i:
-            time.sleep(delay)
+    requested = 0
+    for url in urls:
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=timeout)
+            url = _validate_detail_url(url)
+        except ValueError as exc:
+            listings.append({"url": str(url), "error": str(exc)})
+            continue
+        if requested:
+            time.sleep(delay)
+        requested += 1
+        try:
+            resp = _http_get(url, timeout=timeout)
             resp.raise_for_status()
             listings.append(_parse_detail(BeautifulSoup(resp.text, "html.parser"), url))
-        except Exception as exc:
-            listings.append({"url": url, "error": str(exc)})
+        except (requests.RequestException, AttributeError, TypeError, ValueError) as exc:
+            LOGGER.warning("Could not crawl 591 detail %s: %s", url, exc)
+            listings.append({"url": url, "error": "request failed"})
 
     return json.dumps(
         {"count": len(listings), "listings": listings},

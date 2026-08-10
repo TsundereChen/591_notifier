@@ -1,70 +1,184 @@
 """Notification-safe crawl orchestration."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
-from collections import defaultdict
-from datetime import datetime
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from typing import Any
 
 from crawler import crawl_rent_list
-from main import init_db, insert_notified_listing, listing_exists, load_config
+from main import (
+    init_db,
+    insert_notified_listing,
+    load_config,
+    mark_delivery_ambiguous,
+    notified_listing_ids,
+    reserve_delivery,
+)
 
 MAX_RESULTS_PER_REGION = 30
 LOGGER = logging.getLogger(__name__)
 
 
-async def crawl_and_notify(config_path, notify, run_in_thread=True):
-    """Notify unseen listings, storing each only after notification succeeds.
+async def _sync_call(run_in_thread: bool, function, *args, **kwargs):
+    if run_in_thread:
+        return await asyncio.to_thread(function, *args, **kwargs)
+    return function(*args, **kwargs)
 
-    `notify` is an async callable receiving `(region_name, listing)`. A failed
-    notification is deliberately not persisted, so a later crawl can retry it.
+
+def _receipt_ids(receipt: Any) -> tuple[int | None, int | None]:
+    if receipt is None:
+        return None, None
+    if isinstance(receipt, dict):
+        return receipt.get("chat_id"), receipt.get("message_id")
+    chat = getattr(receipt, "chat", None)
+    chat_id = getattr(chat, "id", None) or getattr(receipt, "chat_id", None)
+    return chat_id, getattr(receipt, "message_id", None)
+
+
+async def crawl_and_notify(
+    config_path,
+    notify: Callable[[str, dict[str, Any]], Awaitable[Any]],
+    run_in_thread: bool = True,
+) -> dict[str, int]:
+    """Notify at most 30 IDs per county, with durable duplicate suppression.
+
+    A minimal delivery reservation is committed before contacting Telegram. If
+    the outcome becomes uncertain, that ID is marked ambiguous and is not sent
+    again automatically. Full listing data is written only after send_message
+    returns successfully.
     """
-    config = load_config(config_path)
-    jobs_by_region = defaultdict(list)
-    for job in config["jobs"]:
-        jobs_by_region[job["region_id"]].append(job)
-
-    conn = init_db(config["database"], regions=jobs_by_region)
-    summary = {"fetched": 0, "notified": 0, "skipped": 0, "failed": 0}
-    now = datetime.now().isoformat(timespec="seconds")
+    config = await _sync_call(run_in_thread, load_config, config_path)
+    conn = await _sync_call(
+        run_in_thread,
+        init_db,
+        config["database"],
+        [job["region_id"] for job in config["jobs"]],
+    )
+    summary = {
+        "fetched": 0,
+        "notified": 0,
+        "skipped": 0,
+        "failed": 0,
+        "ambiguous": 0,
+        "parse_failed": 0,
+    }
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
-        for region_id, jobs in jobs_by_region.items():
-            considered = set()
-            for job in jobs:
-                if len(considered) >= MAX_RESULTS_PER_REGION:
+        for job in config["jobs"]:
+            region_id = job["region_id"]
+            kwargs = {
+                "region": region_id,
+                "sections": job["section_ids"] or None,
+                "kinds": job["kind_ids"] or None,
+                "price_min": job["price_min"],
+                "price_max": job["price_max"],
+                "page": 1,
+            }
+            payload = await _sync_call(run_in_thread, crawl_rent_list, **kwargs)
+            data = json.loads(payload)
+            if not isinstance(data, dict) or not isinstance(data.get("listings"), list):
+                raise ValueError("crawler returned an invalid payload")
+            summary["parse_failed"] += int(data.get("parse_error_count", 0))
+
+            page: list[dict[str, Any]] = []
+            seen_page: set[str] = set()
+            for listing in data["listings"]:
+                if not isinstance(listing, dict) or listing.get("id") is None:
+                    summary["parse_failed"] += 1
+                    continue
+                listing_id = str(listing["id"])
+                if listing_id in seen_page:
+                    continue
+                seen_page.add(listing_id)
+                page.append(listing)
+                if len(page) == MAX_RESULTS_PER_REGION:
                     break
-                kwargs = {
-                    "region": region_id,
-                    "sections": job["section_ids"] or None,
-                    "kinds": job["kind_ids"] or None,
-                    "price_min": job["price_min"],
-                    "price_max": job["price_max"],
-                    "page": 1,
-                }
-                if run_in_thread:
-                    payload = await asyncio.to_thread(crawl_rent_list, **kwargs)
-                else:
-                    payload = crawl_rent_list(**kwargs)
-                data = json.loads(payload)
-                for listing in data["listings"]:
-                    listing_id = str(listing["id"])
-                    if listing_id in considered:
-                        continue
-                    considered.add(listing_id)
-                    summary["fetched"] += 1
-                    if listing_exists(conn, region_id, listing_id):
-                        summary["skipped"] += 1
-                        continue
+
+            summary["fetched"] += len(page)
+            existing = await _sync_call(
+                run_in_thread,
+                notified_listing_ids,
+                conn,
+                region_id,
+                [str(listing["id"]) for listing in page],
+                seen_at=now,
+            )
+            for listing in page:
+                listing_id = str(listing["id"])
+                if listing_id in existing:
+                    summary["skipped"] += 1
+                    continue
+
+                reservation = await _sync_call(
+                    run_in_thread, reserve_delivery, conn, region_id, listing_id, now
+                )
+                if reservation == "sent":
+                    summary["skipped"] += 1
+                    continue
+                if reservation == "ambiguous":
+                    summary["ambiguous"] += 1
+                    LOGGER.warning(
+                        "Skipping listing %s because an earlier send outcome is ambiguous",
+                        listing_id,
+                    )
+                    continue
+
+                try:
+                    receipt = await notify(data["region"], listing)
+                except Exception:
+                    LOGGER.exception(
+                        "Notification outcome is uncertain for listing %s", listing_id
+                    )
+                    await _sync_call(
+                        run_in_thread,
+                        mark_delivery_ambiguous,
+                        conn,
+                        region_id,
+                        listing_id,
+                        now,
+                    )
+                    summary["failed"] += 1
+                    summary["ambiguous"] += 1
+                    continue
+
+                chat_id, message_id = _receipt_ids(receipt)
+                try:
+                    await _sync_call(
+                        run_in_thread,
+                        insert_notified_listing,
+                        conn,
+                        listing,
+                        region_id,
+                        now,
+                        telegram_chat_id=chat_id,
+                        telegram_message_id=message_id,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Telegram accepted listing %s but SQLite finalization failed",
+                        listing_id,
+                    )
                     try:
-                        await notify(data["region"], listing)
+                        await _sync_call(
+                            run_in_thread,
+                            mark_delivery_ambiguous,
+                            conn,
+                            region_id,
+                            listing_id,
+                            now,
+                        )
                     except Exception:
-                        LOGGER.exception("Failed to notify listing %s", listing_id)
-                        summary["failed"] += 1
-                        continue
-                    insert_notified_listing(conn, listing, region_id, now)
-                    summary["notified"] += 1
-                    if len(considered) >= MAX_RESULTS_PER_REGION:
-                        break
+                        LOGGER.exception(
+                            "Could not mark listing %s as ambiguous", listing_id
+                        )
+                    summary["failed"] += 1
+                    summary["ambiguous"] += 1
+                    continue
+                summary["notified"] += 1
     finally:
-        conn.close()
+        await _sync_call(run_in_thread, conn.close)
     return summary

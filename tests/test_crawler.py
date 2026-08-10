@@ -12,12 +12,15 @@ from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import requests
 from bs4 import BeautifulSoup
 
 from crawler import (
     KINDS,
     REGIONS,
     SECTIONS,
+    CrawlerParseError,
+    _http_get,
     _parse_detail,
     _parse_item,
     _parse_spec,
@@ -260,6 +263,11 @@ class TestParseItem:
         assert item["floor"] == ""
         assert item["price_value"] == 3000
 
+    def test_missing_title_link_is_a_clear_parse_error(self):
+        soup = BeautifulSoup('<div class="item" data-id="broken"></div>', "html.parser")
+        with pytest.raises(ValueError, match="no title link"):
+            _parse_item(soup.div)
+
 
 # ---------------------------------------------------------------------------
 # crawl_rent_list (HTTP mocked with the fixture)
@@ -275,7 +283,7 @@ def _mock_response(html):
 
 class TestCrawlRentList:
     def _crawl(self, **kwargs):
-        with mock.patch("crawler.requests.get") as mget:
+        with mock.patch("crawler._http_get") as mget:
             mget.return_value = _mock_response(FIXTURE_HTML)
             result = json.loads(crawl_rent_list(**kwargs))
         return result, mget
@@ -328,29 +336,78 @@ class TestCrawlRentList:
         result, _ = self._crawl()
         listing = result["listings"][0]
         for key in (
-            "id", "title", "url", "image", "price", "price_value", "tags",
-            "kind", "layout", "area", "floor", "community", "location",
-            "nearby_transit", "poster", "updated", "views",
+            "id",
+            "title",
+            "url",
+            "image",
+            "price",
+            "price_value",
+            "tags",
+            "kind",
+            "layout",
+            "area",
+            "floor",
+            "community",
+            "location",
+            "nearby_transit",
+            "poster",
+            "updated",
+            "views",
         ):
             assert key in listing, key
 
     def test_http_error_propagates(self):
-        with mock.patch("crawler.requests.get") as mget:
+        with mock.patch("crawler._http_get") as mget:
             mget.return_value.raise_for_status.side_effect = Exception("boom")
             with pytest.raises(Exception, match="boom"):
                 crawl_rent_list()
 
     def test_invalid_region_raises_before_http(self):
-        with mock.patch("crawler.requests.get") as mget:
-            with pytest.raises(ValueError):
-                crawl_rent_list(region="宇宙市")
+        with mock.patch("crawler._http_get") as mget, pytest.raises(ValueError):
+            crawl_rent_list(region="宇宙市")
         mget.assert_not_called()
 
     def test_invalid_section_raises_before_http(self):
-        with mock.patch("crawler.requests.get") as mget:
-            with pytest.raises(ValueError):
-                crawl_rent_list(region=3, sections="北屯區")
+        with mock.patch("crawler._http_get") as mget, pytest.raises(ValueError):
+            crawl_rent_list(region=3, sections="北屯區")
         mget.assert_not_called()
+
+    def test_unrecognizable_success_page_is_rejected(self):
+        with (
+            mock.patch(
+                "crawler._http_get",
+                return_value=_mock_response("<html>challenge</html>"),
+            ),
+            pytest.raises(CrawlerParseError, match="listing container"),
+        ):
+            crawl_rent_list()
+
+    def test_one_malformed_card_does_not_discard_valid_cards(self):
+        html = FIXTURE_HTML.replace(
+            '<div class="item" data-id="21803880">',
+            '<div class="item" data-id="broken"></div><div class="item" data-id="21803880">',
+            1,
+        )
+        with mock.patch("crawler._http_get", return_value=_mock_response(html)):
+            result = json.loads(crawl_rent_list())
+        assert result["count"] == 3
+        assert result["parse_error_count"] == 1
+        assert result["parse_errors"][0]["id"] == "broken"
+
+    def test_http_redirect_cannot_escape_591_host(self):
+        redirect = mock.Mock(
+            is_redirect=True,
+            is_permanent_redirect=False,
+            headers={"location": "http://127.0.0.1/internal"},
+        )
+        session = mock.Mock()
+        session.get.return_value = redirect
+        with (
+            mock.patch("crawler._http_session", return_value=session),
+            pytest.raises(ValueError, match="must stay on"),
+        ):
+            _http_get("https://rent.591.com.tw/1", timeout=1)
+        session.get.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +491,7 @@ class TestParseDetail:
 
 class TestCrawlRentDetails:
     def _crawl(self, arg, **kwargs):
-        with mock.patch("crawler.requests.get") as mget:
+        with mock.patch("crawler._http_get") as mget:
             mget.return_value = _mock_response(DETAIL_FIXTURE_HTML)
             result = json.loads(crawl_rent_details(arg, **kwargs))
         return result, mget
@@ -456,19 +513,34 @@ class TestCrawlRentDetails:
         msleep.assert_called_once_with(0.5)
 
     def test_failed_url_yields_error_entry(self):
-        with mock.patch("crawler.requests.get") as mget:
+        with mock.patch("crawler._http_get") as mget:
             ok = _mock_response(DETAIL_FIXTURE_HTML)
             bad = mock.Mock()
-            bad.raise_for_status.side_effect = Exception("404")
+            bad.raise_for_status.side_effect = requests.HTTPError("404")
             mget.side_effect = [bad, ok]
             result = json.loads(
                 crawl_rent_details(
-                    ["https://rent.591.com.tw/dead", "https://rent.591.com.tw/2"],
+                    ["https://rent.591.com.tw/1", "https://rent.591.com.tw/2"],
                     delay=0,
                 )
             )
         assert "error" in result["listings"][0]
         assert result["listings"][1]["id"] == "2"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://rent.591.com.tw/1",
+            "https://example.com/1",
+            "https://rent.591.com.tw.evil.example/1",
+            "https://rent.591.com.tw/not-a-number",
+        ],
+    )
+    def test_rejects_untrusted_detail_urls_before_http(self, url):
+        with mock.patch("crawler._http_get") as mget:
+            result = json.loads(crawl_rent_details(url, delay=0))
+        assert "error" in result["listings"][0]
+        mget.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -485,17 +557,17 @@ class TestLiveSite:
             assert listing["id"] and listing["title"] and listing["url"]
 
     def test_section_filter(self):
-        data = json.loads(
-            crawl_rent_list(region="新北市", sections="土城區")
-        )
+        data = json.loads(crawl_rent_list(region="新北市", sections="土城區"))
         assert data["count"] > 0
         for listing in data["listings"]:
             assert listing["location"].startswith("土城區")
 
     def test_detail_page(self):
-        data = json.loads(crawl_rent_details("https://rent.591.com.tw/21803874"))
+        page = json.loads(crawl_rent_list())
+        source = page["listings"][0]
+        data = json.loads(crawl_rent_details(source["url"]))
         listing = data["listings"][0]
-        assert listing["id"] == "21803874"
+        assert listing["id"] == source["id"]
         assert listing["title"]
         assert listing["price_value"] > 0
         assert listing["address"]

@@ -12,4 +12,8 @@ htmlcov/
 # Runtime state and secrets
 *.db
 *.db-*
+config.yaml
+config.yaml.lock
 config.local.yaml
+.591-notifier.lock
+.*.tmp
