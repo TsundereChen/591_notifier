@@ -47,6 +47,11 @@ from .notifier import crawl_and_notify
 
 LOGGER = logging.getLogger(__name__)
 CRAWL_JOB_NAME = "scheduled-crawl"
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+REDACTED = "[REDACTED]"
+TELEGRAM_BOT_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_-])\d{5,16}:[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])"
+)
 
 SCHEDULE_PRESETS = {
     "5m": ("每 5 分鐘", "*/5 * * * *"),
@@ -68,6 +73,32 @@ PRICE_PRESETS = {
 PRICE_STEP = 5000
 DEFAULT_PRICE_MAX = 50000
 MAX_IMAGES_PER_LISTING = 10
+
+
+def _redact_sensitive_text(text, sensitive_values=()):
+    for value in sensitive_values:
+        if value:
+            text = text.replace(str(value), REDACTED)
+    return TELEGRAM_BOT_TOKEN_PATTERN.sub(REDACTED, text)
+
+
+class _RedactingFormatter(logging.Formatter):
+    """Redact secrets after rendering the complete log record and traceback."""
+
+    def __init__(self, *args, sensitive_values=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.sensitive_values = tuple(sensitive_values)
+
+    def format(self, record):
+        return _redact_sensitive_text(super().format(record), self.sensitive_values)
+
+
+def _configure_logging(token=None):
+    handler = logging.StreamHandler()
+    handler.setFormatter(_RedactingFormatter(LOG_FORMAT, sensitive_values=(token,)))
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"), handlers=[handler], force=True
+    )
 
 
 def _store(application):
@@ -900,11 +931,8 @@ def build_application(token, config_path, template_path=None, allowed_user_id=No
 
 
 def main():
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
     token = os.getenv("TELEGRAM_BOT_TOKEN")
+    _configure_logging(token)
     if not token:
         raise RuntimeError("必須設定 TELEGRAM_BOT_TOKEN")
     config_path = os.getenv("CONFIG_PATH", "config.yaml")

@@ -1,6 +1,8 @@
 """Unit tests for bot menus, authorization, and background crawl control."""
 
 import asyncio
+import logging
+import sys
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -983,16 +985,71 @@ def test_build_application_closes_lock_when_telegram_builder_fails(
 
 
 def test_main_requires_token(monkeypatch):
+    configure_logging = MagicMock()
+    monkeypatch.setattr(bot, "_configure_logging", configure_logging)
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
 
     with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
         bot.main()
 
+    configure_logging.assert_called_once_with(None)
+
+
+def test_redacting_formatter_hides_token_in_message_and_traceback():
+    token = "1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    formatter = bot._RedactingFormatter(
+        "%(levelname)s %(message)s", sensitive_values=(token,)
+    )
+    record = logging.LogRecord(
+        "httpx",
+        logging.INFO,
+        __file__,
+        1,
+        "POST https://api.telegram.org/bot%s/getMe",
+        (token,),
+        None,
+    )
+
+    message = formatter.format(record)
+
+    assert token not in message
+    assert message == ("INFO POST https://api.telegram.org/bot[REDACTED]/getMe")
+
+    try:
+        raise RuntimeError(f"request failed for token {token}")
+    except RuntimeError:
+        exception_record = logging.LogRecord(
+            "telegram",
+            logging.ERROR,
+            __file__,
+            1,
+            "polling failed",
+            (),
+            sys.exc_info(),
+        )
+
+    exception_message = formatter.format(exception_record)
+
+    assert token not in exception_message
+    assert "request failed for token [REDACTED]" in exception_message
+
+
+def test_redacting_formatter_hides_unconfigured_telegram_token_shape():
+    token = "987654321:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    formatter = bot._RedactingFormatter("%(message)s")
+    record = logging.LogRecord(
+        "httpx", logging.INFO, __file__, 1, "url contains %s", (token,), None
+    )
+
+    assert formatter.format(record) == "url contains [REDACTED]"
+
 
 def test_main_builds_and_runs_polling(monkeypatch):
     application = SimpleNamespace(run_polling=MagicMock())
     build = MagicMock(return_value=application)
+    configure_logging = MagicMock()
     monkeypatch.setattr(bot, "build_application", build)
+    monkeypatch.setattr(bot, "_configure_logging", configure_logging)
     monkeypatch.setenv(
         "TELEGRAM_BOT_TOKEN",
         "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -1002,6 +1059,9 @@ def test_main_builds_and_runs_polling(monkeypatch):
 
     bot.main()
 
+    configure_logging.assert_called_once_with(
+        "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    )
     build.assert_called_once_with(
         "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         "/tmp/test-config.yaml",
