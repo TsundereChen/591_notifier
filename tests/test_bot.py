@@ -9,6 +9,7 @@ import pytest
 
 from rent591_notifier import bot
 from rent591_notifier.bot import (
+    MAX_IMAGES_PER_LISTING,
     _allowed_user_id,
     _adjust_price_bound,
     _authorized,
@@ -17,8 +18,10 @@ from rent591_notifier.bot import (
     _format_schedule,
     _home_view,
     _listing_message,
+    _listing_images,
     _price_view,
     _regions_view,
+    _send_listing,
     callback,
     enqueue_crawl,
 )
@@ -48,7 +51,12 @@ def bot_harness(tmp_path):
             "allowed_user_id": 123,
             "crawl_task": None,
         },
-        bot=SimpleNamespace(send_message=AsyncMock(), set_my_commands=AsyncMock()),
+        bot=SimpleNamespace(
+            send_media_group=AsyncMock(),
+            send_message=AsyncMock(),
+            send_photo=AsyncMock(),
+            set_my_commands=AsyncMock(),
+        ),
         job_queue=FakeJobQueue(),
     )
     message = SimpleNamespace(
@@ -190,6 +198,86 @@ def test_listing_message_omits_empty_optional_details():
     text = _listing_message("台北市", {"id": "123"})
     assert "🏢" not in text
     assert "https://" not in text
+
+
+@pytest.mark.asyncio
+async def test_listing_images_loads_detail_album_deduplicates_and_caps(monkeypatch):
+    images = [f"https://img.591.com.tw/{index}.jpg" for index in range(12)]
+    images.insert(2, images[0])
+    detail_crawl = MagicMock(
+        return_value=bot.json.dumps({"listings": [{"images": images}]})
+    )
+    monkeypatch.setattr(bot, "crawl_rent_details", detail_crawl)
+
+    result = await _listing_images(
+        {
+            "id": "123",
+            "url": "https://rent.591.com.tw/123",
+            "image": "https://img.591.com.tw/thumbnail.jpg",
+        }
+    )
+
+    assert result == [f"https://img.591.com.tw/{index}.jpg" for index in range(10)]
+    assert len(result) == MAX_IMAGES_PER_LISTING
+    detail_crawl.assert_called_once_with("https://rent.591.com.tw/123", delay=0)
+
+
+@pytest.mark.asyncio
+async def test_listing_images_falls_back_to_list_thumbnail(monkeypatch):
+    monkeypatch.setattr(
+        bot,
+        "crawl_rent_details",
+        MagicMock(return_value=bot.json.dumps({"listings": [{"error": "failed"}]})),
+    )
+
+    result = await _listing_images(
+        {
+            "id": "123",
+            "url": "https://rent.591.com.tw/123",
+            "image": "https://img.591.com.tw/thumbnail.jpg",
+        }
+    )
+
+    assert result == ["https://img.591.com.tw/thumbnail.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_send_listing_uses_photo_or_media_group():
+    telegram_bot = SimpleNamespace(
+        send_media_group=AsyncMock(
+            return_value=[
+                SimpleNamespace(message_id=10),
+                SimpleNamespace(message_id=11),
+            ]
+        ),
+        send_message=AsyncMock(),
+        send_photo=AsyncMock(return_value=SimpleNamespace(message_id=9)),
+    )
+
+    photo = await _send_listing(
+        telegram_bot, 123, "listing text", ["https://img.591.com.tw/one.jpg"]
+    )
+    assert photo.message_id == 9
+    telegram_bot.send_photo.assert_awaited_once_with(
+        chat_id=123,
+        photo="https://img.591.com.tw/one.jpg",
+        caption="listing text",
+    )
+
+    album = await _send_listing(
+        telegram_bot,
+        123,
+        "listing text",
+        ["https://img.591.com.tw/one.jpg", "https://img.591.com.tw/two.jpg"],
+    )
+    assert album.message_id == 10
+    media = telegram_bot.send_media_group.await_args.kwargs["media"]
+    assert [item.media for item in media] == [
+        "https://img.591.com.tw/one.jpg",
+        "https://img.591.com.tw/two.jpg",
+    ]
+    assert [item.caption for item in media] == ["listing text", None]
+    telegram_bot.send_message.assert_not_awaited()
 
 
 def test_config_summary_is_structured_and_human_readable():

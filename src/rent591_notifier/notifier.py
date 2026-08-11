@@ -48,8 +48,8 @@ async def crawl_and_notify(
 
     A minimal delivery reservation is committed before contacting Telegram. If
     the outcome becomes uncertain, that ID is marked ambiguous and is not sent
-    again automatically. Full listing data is written only after send_message
-    returns successfully.
+    again automatically. Full listing data is written only after Telegram
+    accepts the notification.
     """
     config = await _sync_call(run_in_thread, load_config, config_path)
     conn = await _sync_call(

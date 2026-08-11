@@ -1,6 +1,7 @@
 """Interactive Telegram bot for configuring and running the 591 notifier."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -8,7 +9,13 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.triggers.cron import CronTrigger
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ChatType
 from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
@@ -22,7 +29,14 @@ from telegram.ext import (
 )
 
 from .config_store import ConfigStore
-from .crawler import KINDS, REGIONS, SECTIONS, _resolve_region, _validate_price_range
+from .crawler import (
+    KINDS,
+    REGIONS,
+    SECTIONS,
+    _resolve_region,
+    _validate_price_range,
+    crawl_rent_details,
+)
 from .database import (
     ambiguous_deliveries,
     init_db,
@@ -53,6 +67,7 @@ PRICE_PRESETS = {
 }
 PRICE_STEP = 5000
 DEFAULT_PRICE_MAX = 50000
+MAX_IMAGES_PER_LISTING = 10
 
 
 def _store(application):
@@ -449,6 +464,67 @@ def _listing_message(region, listing):
     return "\n".join(lines)
 
 
+def _usable_image_urls(values):
+    """Return unique HTTP image URLs within Telegram's album limit."""
+    images = []
+    for value in values:
+        if (
+            isinstance(value, str)
+            and value.startswith(("https://", "http://"))
+            and value not in images
+        ):
+            images.append(value)
+            if len(images) == MAX_IMAGES_PER_LISTING:
+                break
+    return images
+
+
+async def _listing_images(listing):
+    """Load the listing's detail-page album, falling back to its thumbnail."""
+    fallback = _usable_image_urls([listing.get("image")])
+    url = listing.get("url")
+    if not url:
+        return fallback
+
+    try:
+        payload = await asyncio.to_thread(crawl_rent_details, url, delay=0)
+        details = json.loads(payload)
+        result = details.get("listings")
+        if (
+            not isinstance(result, list)
+            or not result
+            or not isinstance(result[0], dict)
+        ):
+            raise ValueError("detail crawler returned an invalid payload")
+        images = result[0].get("images")
+        if not isinstance(images, list):
+            return fallback
+        return _usable_image_urls(images) or fallback
+    except Exception:
+        LOGGER.warning(
+            "Could not load detail-page images for listing %s; using its thumbnail",
+            listing.get("id", "unknown"),
+            exc_info=True,
+        )
+        return fallback
+
+
+async def _send_listing(bot, chat_id, text, images):
+    """Send one listing as a photo, album, or text-only fallback."""
+    if len(images) > 1:
+        media = [
+            InputMediaPhoto(media=image, caption=text if index == 0 else None)
+            for index, image in enumerate(images[:MAX_IMAGES_PER_LISTING])
+        ]
+        messages = await bot.send_media_group(chat_id=chat_id, media=media)
+        return messages[0]
+    if images:
+        return await bot.send_photo(chat_id=chat_id, photo=images[0], caption=text)
+    return await bot.send_message(
+        chat_id=chat_id, text=text, disable_web_page_preview=False
+    )
+
+
 def _pending_rows(store):
     data = store.load()
     db_path = resolve_database_path(store.path, data["database"])
@@ -524,11 +600,11 @@ async def _run_crawler(application, status_chat_id=None):
 
     async def notify(region, listing):
         text = _listing_message(region, listing)
+        images = await _listing_images(listing)
+        listing["images"] = images
         for attempt in range(3):
             try:
-                message = await application.bot.send_message(
-                    chat_id=chat_id, text=text, disable_web_page_preview=False
-                )
+                message = await _send_listing(application.bot, chat_id, text, images)
                 return {"chat_id": chat_id, "message_id": message.message_id}
             except RetryAfter as exc:
                 if attempt == 2:
