@@ -3,10 +3,12 @@
 import json
 import logging
 import re
+import ssl
 import threading
 import time
 from urllib.parse import urlencode, urljoin, urlparse
 
+import certifi
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
@@ -36,6 +38,20 @@ HEADERS = {
 }
 
 
+class _CompatibilityTLSAdapter(HTTPAdapter):
+    """Keep TLS verification while tolerating 591's incomplete CA metadata."""
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        context = ssl.create_default_context(cafile=certifi.where())
+        strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
+        if strict:
+            context.verify_flags &= ~strict
+        pool_kwargs["ssl_context"] = context
+        return super().init_poolmanager(
+            connections, maxsize, block=block, **pool_kwargs
+        )
+
+
 class CrawlerParseError(RuntimeError):
     """Raised when a successful HTTP response is not a recognizable list page."""
 
@@ -55,7 +71,7 @@ def _http_session():
             respect_retry_after_header=True,
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry)
+        adapter = _CompatibilityTLSAdapter(max_retries=retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         _THREAD_LOCAL.session = session

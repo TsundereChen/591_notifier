@@ -51,6 +51,8 @@ PRICE_PRESETS = {
     "30-40": ("NT$30,000～40,000", 30000, 40000),
     "o40": ("NT$40,000 以上", 40000, None),
 }
+PRICE_STEP = 5000
+DEFAULT_PRICE_MAX = 50000
 
 
 def _store(application):
@@ -123,12 +125,9 @@ async def _edit(query, text, keyboard):
 
 
 def _home_view(data):
-    active = len(data["crawl"])
     text = (
         "591 租屋通知機器人\n\n"
-        f"已啟用縣市：{active}\n"
-        f"排程：{data['schedule']}\n"
-        f"時區：{data['timezone']}\n\n"
+        f"{_config_summary(data)}\n\n"
         "只有成功傳送通知的物件才會寫入資料庫。每次執行時，"
         "每個縣市最多檢查 30 筆結果。"
     )
@@ -267,15 +266,67 @@ def _format_price(price_min, price_max):
     return f"NT${price_min:,}～{price_max:,}"
 
 
+def _price_bound_label(name, value):
+    return f"{name}：{'不限' if value is None else f'{value:,}'}"
+
+
+def _adjust_price_bound(price_min, price_max, bound, direction):
+    if direction not in {-1, 1}:
+        raise ValueError("price adjustment direction must be -1 or 1")
+    if bound == "min":
+        if price_min is None and direction < 0:
+            return price_min, price_max
+        adjusted = (price_min or 0) + direction * PRICE_STEP
+        adjusted = None if adjusted <= 0 else adjusted
+        if adjusted is not None and price_max is not None:
+            adjusted = min(adjusted, price_max)
+        return adjusted, price_max
+    if bound == "max":
+        baseline = price_max
+        if baseline is None:
+            baseline = max(DEFAULT_PRICE_MAX, price_min or 0)
+        adjusted = max(0, baseline + direction * PRICE_STEP)
+        if price_min is not None:
+            adjusted = max(adjusted, price_min)
+        return price_min, adjusted
+    raise ValueError(f"unknown price bound: {bound!r}")
+
+
 def _price_view(data, region_id):
     job = _job_for_region(data, region_id) or {}
     price = job.get("price") or {}
+    price_min = price.get("min")
+    price_max = price.get("max")
     rows = [
         [InlineKeyboardButton(label, callback_data=f"price_set:{region_id}:{key}")]
         for key, (label, _, _) in PRICE_PRESETS.items()
     ]
     rows.extend(
         [
+            [
+                InlineKeyboardButton(
+                    "−5,000", callback_data=f"price_adjust:{region_id}:min:-1"
+                ),
+                InlineKeyboardButton(
+                    _price_bound_label("最低", price_min),
+                    callback_data=f"price_clear:{region_id}:min",
+                ),
+                InlineKeyboardButton(
+                    "+5,000", callback_data=f"price_adjust:{region_id}:min:1"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "−5,000", callback_data=f"price_adjust:{region_id}:max:-1"
+                ),
+                InlineKeyboardButton(
+                    _price_bound_label("最高", price_max),
+                    callback_data=f"price_clear:{region_id}:max",
+                ),
+                InlineKeyboardButton(
+                    "+5,000", callback_data=f"price_adjust:{region_id}:max:1"
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     "自訂範圍", callback_data=f"price_custom:{region_id}"
@@ -287,7 +338,8 @@ def _price_view(data, region_id):
     return (
         (
             f"{REGIONS[region_id]}租金範圍\n\n目前設定："
-            f"{_format_price(price.get('min'), price.get('max'))}"
+            f"{_format_price(price_min, price_max)}\n"
+            "點選中間的最低／最高租金可取消該端限制。"
         ),
         InlineKeyboardMarkup(rows),
     )
@@ -310,26 +362,43 @@ def _schedule_view(data):
     )
 
 
+def _format_schedule(expression):
+    for label, preset in SCHEDULE_PRESETS.values():
+        if expression == preset:
+            return label
+    match = re.fullmatch(r"\*/(\d+) \* \* \* \*", expression)
+    if match:
+        return f"每 {int(match.group(1))} 分鐘"
+    match = re.fullmatch(r"(\d+) (\d+) \* \* \*", expression)
+    if match:
+        minute, hour = map(int, match.groups())
+        if 0 <= minute <= 59 and 0 <= hour <= 23:
+            return f"每天 {hour:02d}:{minute:02d}"
+    return f"自訂排程（{expression}）"
+
+
 def _config_summary(data):
     lines = [
         "目前設定",
         "",
-        f"排程：{data['schedule']}",
-        f"時區：{data['timezone']}",
+        "排程：",
+        f"  執行頻率：{_format_schedule(data['schedule'])}",
+        f"  時區：{data['timezone']}",
+        "已啟用縣市：",
     ]
+    if not data["crawl"]:
+        lines.append("  無")
+        return "\n".join(lines)
     for job in data["crawl"]:
         price = job.get("price") or {}
         lines.extend(
             [
-                "",
-                f"• {job['region']}",
-                f"  行政區：{'、'.join(map(str, job.get('sections') or [])) or '全部'}",
-                f"  物件類型：{'、'.join(map(str, job.get('kinds') or [])) or '全部'}",
-                f"  租金：{_format_price(price.get('min'), price.get('max'))}",
+                f"  - {job['region']}",
+                f"    行政區：{'、'.join(map(str, job.get('sections') or [])) or '全部'}",
+                f"    物件類型：{'、'.join(map(str, job.get('kinds') or [])) or '全部'}",
+                f"    租金範圍：{_format_price(price.get('min'), price.get('max'))}",
             ]
         )
-    if not data["crawl"]:
-        lines.extend(["", "尚未啟用任何縣市。"])
     return "\n".join(lines)
 
 
@@ -589,6 +658,23 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, price_min, price_max = PRICE_PRESETS[preset]
         store.set_price(int(region), price_min, price_max)
         view = _price_view(store.load(), int(region))
+    elif action.startswith("price_adjust:"):
+        _, region, bound, direction = action.split(":")
+        region_id = int(region)
+        price = (_job_for_region(store.load(), region_id) or {}).get("price") or {}
+        price_min, price_max = _adjust_price_bound(
+            price.get("min"), price.get("max"), bound, int(direction)
+        )
+        store.set_price(region_id, price_min, price_max)
+        view = _price_view(store.load(), region_id)
+    elif action.startswith("price_clear:"):
+        _, region, bound = action.split(":")
+        region_id = int(region)
+        price = (_job_for_region(store.load(), region_id) or {}).get("price") or {}
+        price_min = None if bound == "min" else price.get("min")
+        price_max = None if bound == "max" else price.get("max")
+        store.set_price(region_id, price_min, price_max)
+        view = _price_view(store.load(), region_id)
     elif action.startswith("price_custom:"):
         region_id = int(action.split(":")[1])
         context.user_data["awaiting"] = ("price", region_id)

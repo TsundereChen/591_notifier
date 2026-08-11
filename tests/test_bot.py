@@ -1,21 +1,82 @@
 """Unit tests for bot menus, authorization, and background crawl control."""
 
 import asyncio
+from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from rent591_notifier import bot
 from rent591_notifier.bot import (
     _allowed_user_id,
+    _adjust_price_bound,
     _authorized,
     _config_summary,
     _cron_trigger,
+    _format_schedule,
+    _home_view,
     _listing_message,
+    _price_view,
     _regions_view,
+    callback,
     enqueue_crawl,
 )
 from rent591_notifier.config_store import ConfigStore
+
+
+class FakeJobQueue:
+    def __init__(self, jobs=()):
+        self.jobs = list(jobs)
+        self.scheduled = []
+
+    def get_jobs_by_name(self, name):
+        assert name == bot.CRAWL_JOB_NAME
+        return self.jobs
+
+    def run_custom(self, callback, **kwargs):
+        self.scheduled.append((callback, kwargs))
+
+
+@pytest.fixture
+def bot_harness(tmp_path):
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.bind_owner(123, 123)
+    application = SimpleNamespace(
+        bot_data={
+            "config_store": store,
+            "allowed_user_id": 123,
+            "crawl_task": None,
+        },
+        bot=SimpleNamespace(send_message=AsyncMock(), set_my_commands=AsyncMock()),
+        job_queue=FakeJobQueue(),
+    )
+    message = SimpleNamespace(
+        chat_id=123,
+        text="",
+        reply_text=AsyncMock(),
+    )
+    query = SimpleNamespace(
+        data="",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+        message=message,
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        effective_message=message,
+        callback_query=query,
+    )
+    context = SimpleNamespace(application=application, user_data={})
+    return SimpleNamespace(
+        store=store,
+        application=application,
+        message=message,
+        query=query,
+        update=update,
+        context=context,
+    )
 
 
 def test_valid_cron_uses_configured_timezone():
@@ -47,6 +108,65 @@ def test_regions_menu_marks_enabled_region():
     )
 
 
+def test_region_and_filter_views_cover_enabled_and_unselected_states():
+    disabled_text, disabled_keyboard = bot._region_view({"crawl": []}, 3)
+    assert "狀態：未啟用" in disabled_text
+    assert disabled_keyboard.inline_keyboard[0][0].text == "啟用"
+
+    data = {
+        "crawl": [
+            {
+                "region": "新北市",
+                "sections": ["土城區"],
+                "kinds": ["整層住家"],
+                "price": {"min": 10000},
+            }
+        ]
+    }
+    enabled_text, _ = bot._region_view(data, 3)
+    assert "狀態：已啟用" in enabled_text
+    assert "行政區：土城區" in enabled_text
+    assert "租金：NT$10,000 以上" in enabled_text
+
+    sections_text, sections_keyboard = bot._sections_view(data, 3)
+    assert "已選擇 1 個行政區" in sections_text
+    assert any(
+        button.text == "✅ 土城區"
+        for row in sections_keyboard.inline_keyboard
+        for button in row
+    )
+    empty_sections_text, _ = bot._sections_view({"crawl": []}, 3)
+    assert "未勾選時代表全部行政區" in empty_sections_text
+
+    kinds_text, kinds_keyboard = bot._kinds_view(data, 3)
+    assert "已選擇 1 種類型" in kinds_text
+    assert kinds_keyboard.inline_keyboard[0][0].text == "✅ 整層住家"
+    empty_kinds_text, _ = bot._kinds_view({"crawl": []}, 3)
+    assert "未勾選時代表全部類型" in empty_kinds_text
+
+
+@pytest.mark.parametrize(
+    ("price_min", "price_max", "expected"),
+    [
+        (None, None, "不限"),
+        (None, 20000, "NT$20,000 以下"),
+        (10000, None, "NT$10,000 以上"),
+        (10000, 20000, "NT$10,000～20,000"),
+    ],
+)
+def test_format_price_variants(price_min, price_max, expected):
+    assert bot._format_price(price_min, price_max) == expected
+
+
+def test_schedule_view_lists_presets_and_navigation():
+    text, keyboard = bot._schedule_view(
+        {"schedule": "*/15 * * * *", "timezone": "Asia/Taipei"}
+    )
+    assert "*/15 * * * *" in text
+    assert keyboard.inline_keyboard[0][0].callback_data == "schedule_set:5m"
+    assert keyboard.inline_keyboard[-1][0].callback_data == "home"
+
+
 def test_listing_message_contains_essential_fields():
     text = _listing_message(
         "新北市",
@@ -66,16 +186,241 @@ def test_listing_message_contains_essential_fields():
     assert text.endswith("https://rent.591.com.tw/123")
 
 
-def test_config_summary_handles_all_filters():
+def test_listing_message_omits_empty_optional_details():
+    text = _listing_message("台北市", {"id": "123"})
+    assert "🏢" not in text
+    assert "https://" not in text
+
+
+def test_config_summary_is_structured_and_human_readable():
     text = _config_summary(
         {
-            "schedule": "0 * * * *",
+            "schedule": "*/15 * * * *",
             "timezone": "Asia/Taipei",
-            "crawl": [{"region": "台北市", "sections": [], "kinds": [], "price": {}}],
+            "crawl": [
+                {
+                    "region": "台北市",
+                    "sections": ["中正區"],
+                    "kinds": ["整層住家"],
+                    "price": {"min": 10000, "max": 30000},
+                }
+            ],
         }
     )
-    assert "台北市" in text
-    assert text.count("全部") == 2
+    assert "執行頻率：每 15 分鐘" in text
+    assert "時區：Asia/Taipei" in text
+    assert "  - 台北市" in text
+    assert "    行政區：中正區" in text
+    assert "    物件類型：整層住家" in text
+    assert "    租金範圍：NT$10,000～30,000" in text
+    assert "*/15 * * * *" not in text
+
+
+def test_home_view_contains_detailed_human_readable_settings():
+    text, _ = _home_view(
+        {
+            "schedule": "*/15 * * * *",
+            "timezone": "Asia/Taipei",
+            "crawl": [
+                {
+                    "region": "新北市",
+                    "sections": ["土城區", "中和區"],
+                    "kinds": [],
+                    "price": {"min": 10000, "max": 30000},
+                }
+            ],
+        }
+    )
+
+    assert "執行頻率：每 15 分鐘" in text
+    assert "行政區：土城區、中和區" in text
+    assert "物件類型：全部" in text
+    assert "租金範圍：NT$10,000～30,000" in text
+
+
+def test_config_summary_handles_no_enabled_regions():
+    text = _config_summary(
+        {"schedule": "0 * * * *", "timezone": "Asia/Taipei", "crawl": []}
+    )
+
+    assert "執行頻率：每小時" in text
+    assert "已啟用縣市：\n  無" in text
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ("0 8 * * *", "每天 08:00"),
+        ("*/7 * * * *", "每 7 分鐘"),
+        ("30 22 * * *", "每天 22:30"),
+        ("99 99 * * *", "自訂排程（99 99 * * *）"),
+        ("0 9 * * 1", "自訂排程（0 9 * * 1）"),
+    ],
+)
+def test_format_schedule(expression, expected):
+    assert _format_schedule(expression) == expected
+
+
+def test_price_view_has_direct_controls_for_each_bound():
+    _, keyboard = _price_view(
+        {"crawl": [{"region": "新北市", "price": {"min": 10000, "max": 30000}}]},
+        3,
+    )
+    rows = keyboard.inline_keyboard
+    assert [button.text for button in rows[6]] == ["−5,000", "最低：10,000", "+5,000"]
+    assert [button.text for button in rows[7]] == ["−5,000", "最高：30,000", "+5,000"]
+    assert rows[6][0].callback_data == "price_adjust:3:min:-1"
+    assert rows[7][2].callback_data == "price_adjust:3:max:1"
+
+
+@pytest.mark.parametrize(
+    ("price_min", "price_max", "bound", "direction", "expected"),
+    [
+        (10000, 30000, "min", -1, (5000, 30000)),
+        (10000, 30000, "min", 1, (15000, 30000)),
+        (10000, 30000, "max", -1, (10000, 25000)),
+        (10000, 30000, "max", 1, (10000, 35000)),
+        (30000, 30000, "min", 1, (30000, 30000)),
+        (30000, 30000, "max", -1, (30000, 30000)),
+        (None, 30000, "min", -1, (None, 30000)),
+        (None, 30000, "min", 1, (5000, 30000)),
+        (5000, 30000, "min", -1, (None, 30000)),
+        (10000, None, "min", 1, (15000, None)),
+        (None, 30000, "max", 1, (None, 35000)),
+        (10000, None, "max", -1, (10000, 45000)),
+        (10000, None, "max", 1, (10000, 55000)),
+    ],
+)
+def test_adjust_price_bound(price_min, price_max, bound, direction, expected):
+    assert _adjust_price_bound(price_min, price_max, bound, direction) == expected
+
+
+def test_adjust_price_bound_rejects_invalid_actions():
+    with pytest.raises(ValueError, match="direction"):
+        _adjust_price_bound(10000, 30000, "min", 0)
+    with pytest.raises(ValueError, match="unknown price bound"):
+        _adjust_price_bound(10000, 30000, "middle", 1)
+
+
+@pytest.mark.asyncio
+async def test_price_callbacks_persist_direct_adjustments_and_clears(tmp_path):
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.bind_owner(123, 123)
+    store.toggle_region(3)
+    store.set_price(3, 10000, 30000)
+    application = SimpleNamespace(
+        bot_data={"config_store": store, "allowed_user_id": 123}
+    )
+    query = SimpleNamespace(
+        data="",
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(id=123, type="private"),
+        callback_query=query,
+    )
+    context = SimpleNamespace(application=application, user_data={})
+
+    query.data = "price_adjust:3:min:-1"
+    await callback(update, context)
+    assert store.load()["crawl"][0]["price"] == {"min": 5000, "max": 30000}
+
+    query.data = "price_adjust:3:max:1"
+    await callback(update, context)
+    assert store.load()["crawl"][0]["price"] == {"min": 5000, "max": 35000}
+
+    query.data = "price_clear:3:min"
+    await callback(update, context)
+    assert store.load()["crawl"][0]["price"] == {"max": 35000}
+
+    query.data = "price_clear:3:max"
+    await callback(update, context)
+    assert store.load()["crawl"][0]["price"] == {}
+    assert query.answer.await_count == 4
+    assert query.edit_message_text.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_callback_dispatches_all_configuration_actions(bot_harness, monkeypatch):
+    harness = bot_harness
+    reschedule = MagicMock()
+    enqueue = MagicMock(return_value=object())
+    resolve_pending = MagicMock(return_value=True)
+    pending_view = AsyncMock(return_value=("pending", bot.InlineKeyboardMarkup([])))
+    monkeypatch.setattr(bot, "reschedule", reschedule)
+    monkeypatch.setattr(bot, "enqueue_crawl", enqueue)
+    monkeypatch.setattr(bot, "_resolve_pending", resolve_pending)
+    monkeypatch.setattr(bot, "_pending_view", pending_view)
+
+    async def press(action):
+        harness.query.data = action
+        await callback(harness.update, harness.context)
+
+    for action in ("home", "regions", "region:3", "region_toggle:3"):
+        await press(action)
+    assert harness.store.load()["crawl"][0]["region"] == "新北市"
+
+    for action in (
+        "sections:3",
+        "section_toggle:3:39",
+        "sections_clear:3",
+        "kinds:3",
+        "kind_toggle:3:1",
+        "kinds_clear:3",
+        "price:3",
+        "price_set:3:10-20",
+    ):
+        await press(action)
+    job = harness.store.load()["crawl"][0]
+    assert job["sections"] == []
+    assert job["kinds"] == []
+    assert job["price"] == {"min": 10000, "max": 20000}
+
+    await press("price_custom:3")
+    assert harness.context.user_data["awaiting"] == ("price", 3)
+    harness.message.reply_text.assert_awaited()
+
+    await press("schedule")
+    await press("schedule_set:30m")
+    assert harness.store.load()["schedule"] == "*/30 * * * *"
+    reschedule.assert_called_once_with(harness.application)
+
+    await press("schedule_custom")
+    assert harness.context.user_data["awaiting"] == ("schedule", None)
+
+    await press("show")
+    await press("pending")
+    pending_view.assert_awaited()
+
+    await press("delivery:sent:3:listing-1")
+    await press("delivery:retry:3:listing-2")
+    assert resolve_pending.call_args_list[0].args[-1] is True
+    assert resolve_pending.call_args_list[1].args[-1] is False
+
+    edits_before_invalid = harness.query.edit_message_text.await_count
+    await press("delivery:invalid:3:listing-3")
+    assert harness.query.edit_message_text.await_count == edits_before_invalid
+
+    await press("run")
+    enqueue.assert_called_once_with(harness.application, 123)
+    assert "正在背景執行" in harness.message.reply_text.await_args.args[0]
+
+    edits_before_unknown = harness.query.edit_message_text.await_count
+    await press("unknown-action")
+    assert harness.query.edit_message_text.await_count == edits_before_unknown
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_unauthorized_update(bot_harness):
+    bot_harness.update.effective_user.id = 999
+
+    await callback(bot_harness.update, bot_harness.context)
+
+    bot_harness.query.answer.assert_awaited_once_with(
+        "僅允許指定擁有者在與機器人的私聊中操作。", show_alert=True
+    )
 
 
 def test_allowed_user_id_is_required_and_validated(monkeypatch):
@@ -85,6 +430,75 @@ def test_allowed_user_id_is_required_and_validated(monkeypatch):
     with pytest.raises(RuntimeError, match="正整數"):
         _allowed_user_id("0")
     assert _allowed_user_id("123") == 123
+
+
+def test_allowed_user_id_rejects_non_integer():
+    with pytest.raises(RuntimeError, match="必須是整數"):
+        _allowed_user_id("not-a-number")
+
+
+@pytest.mark.asyncio
+async def test_authorization_rejects_missing_update_and_wrong_existing_owner(tmp_path):
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.bind_owner(456, 456)
+    application = SimpleNamespace(
+        bot_data={"config_store": store, "allowed_user_id": 123}
+    )
+    missing = SimpleNamespace(effective_user=None, effective_chat=None)
+    wrong_owner = SimpleNamespace(
+        effective_user=SimpleNamespace(id=123),
+        effective_chat=SimpleNamespace(id=123, type="private"),
+    )
+
+    assert not await _authorized(missing, application)
+    assert not await _authorized(wrong_owner, application)
+
+
+@pytest.mark.asyncio
+async def test_reject_uses_callback_alert_or_message_reply():
+    query = SimpleNamespace(answer=AsyncMock())
+    callback_update = SimpleNamespace(callback_query=query, effective_message=None)
+    await bot._reject(callback_update)
+    query.answer.assert_awaited_once_with(
+        "僅允許指定擁有者在與機器人的私聊中操作。", show_alert=True
+    )
+
+    message = SimpleNamespace(reply_text=AsyncMock())
+    message_update = SimpleNamespace(callback_query=None, effective_message=message)
+    await bot._reject(message_update)
+    message.reply_text.assert_awaited_once()
+
+    await bot._reject(SimpleNamespace(callback_query=None, effective_message=None))
+
+
+@pytest.mark.asyncio
+async def test_edit_handles_unchanged_message_and_reraises_other_errors():
+    keyboard = MagicMock()
+    unchanged = SimpleNamespace(
+        edit_message_text=AsyncMock(
+            side_effect=bot.BadRequest("Message is not modified")
+        )
+    )
+    await bot._edit(unchanged, "same", keyboard)
+
+    failed = SimpleNamespace(
+        edit_message_text=AsyncMock(side_effect=bot.BadRequest("message missing"))
+    )
+    with pytest.raises(bot.BadRequest, match="message missing"):
+        await bot._edit(failed, "new", keyboard)
+
+
+def test_reschedule_replaces_existing_job(bot_harness):
+    old_job = SimpleNamespace(schedule_removal=MagicMock())
+    bot_harness.application.job_queue = FakeJobQueue([old_job])
+
+    bot.reschedule(bot_harness.application)
+
+    old_job.schedule_removal.assert_called_once_with()
+    scheduled, kwargs = bot_harness.application.job_queue.scheduled[0]
+    assert scheduled is bot.scheduled_crawl
+    assert kwargs["name"] == bot.CRAWL_JOB_NAME
+    assert kwargs["job_kwargs"]["coalesce"] is True
 
 
 @pytest.mark.asyncio
@@ -137,6 +551,114 @@ async def test_existing_owner_can_complete_missing_private_chat_binding(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler_name", "claim"),
+    [
+        ("start", True),
+        ("menu", False),
+        ("crawl_command", False),
+        ("pending_command", False),
+    ],
+)
+async def test_command_handlers_reject_unauthorized_updates(
+    bot_harness, monkeypatch, handler_name, claim
+):
+    authorized = AsyncMock(return_value=False)
+    reject = AsyncMock()
+    monkeypatch.setattr(bot, "_authorized", authorized)
+    monkeypatch.setattr(bot, "_reject", reject)
+
+    await getattr(bot, handler_name)(bot_harness.update, bot_harness.context)
+
+    if claim:
+        authorized.assert_awaited_once_with(
+            bot_harness.update, bot_harness.application, claim=True
+        )
+    else:
+        authorized.assert_awaited_once_with(bot_harness.update, bot_harness.application)
+    reject.assert_awaited_once_with(bot_harness.update)
+
+
+@pytest.mark.asyncio
+async def test_command_handlers_reply_for_authorized_user(bot_harness, monkeypatch):
+    authorized = AsyncMock(return_value=True)
+    pending_view = AsyncMock(return_value=("pending", bot.InlineKeyboardMarkup([])))
+    enqueue = MagicMock(side_effect=[object(), None])
+    monkeypatch.setattr(bot, "_authorized", authorized)
+    monkeypatch.setattr(bot, "_pending_view", pending_view)
+    monkeypatch.setattr(bot, "enqueue_crawl", enqueue)
+
+    await bot.start(bot_harness.update, bot_harness.context)
+    await bot.menu(bot_harness.update, bot_harness.context)
+    await bot.crawl_command(bot_harness.update, bot_harness.context)
+    await bot.crawl_command(bot_harness.update, bot_harness.context)
+    await bot.pending_command(bot_harness.update, bot_harness.context)
+
+    replies = [call.args[0] for call in bot_harness.message.reply_text.await_args_list]
+    assert any("591 租屋通知機器人" in reply for reply in replies)
+    assert "正在背景執行爬蟲……" in replies
+    assert "爬蟲正在執行中，請稍候。" in replies
+    assert "pending" in replies
+
+
+@pytest.mark.asyncio
+async def test_text_input_rejects_unauthorized_and_unprompted_text(
+    bot_harness, monkeypatch
+):
+    monkeypatch.setattr(bot, "_authorized", AsyncMock(return_value=False))
+    reject = AsyncMock()
+    monkeypatch.setattr(bot, "_reject", reject)
+    await bot.text_input(bot_harness.update, bot_harness.context)
+    reject.assert_awaited_once()
+
+    monkeypatch.setattr(bot, "_authorized", AsyncMock(return_value=True))
+    await bot.text_input(bot_harness.update, bot_harness.context)
+    assert "請使用 /menu" in bot_harness.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_text_input_validates_and_persists_schedule(bot_harness, monkeypatch):
+    reschedule = MagicMock()
+    monkeypatch.setattr(bot, "reschedule", reschedule)
+
+    bot_harness.context.user_data["awaiting"] = ("schedule", None)
+    bot_harness.message.text = "invalid cron"
+    await bot.text_input(bot_harness.update, bot_harness.context)
+    assert bot_harness.context.user_data["awaiting"] == ("schedule", None)
+    assert "cron" in bot_harness.message.reply_text.await_args.args[0]
+
+    bot_harness.context.user_data["awaiting"] = ("schedule", None)
+    bot_harness.message.text = "0 9 * * *"
+    await bot.text_input(bot_harness.update, bot_harness.context)
+    assert bot_harness.store.load()["schedule"] == "0 9 * * *"
+    reschedule.assert_called_once_with(bot_harness.application)
+    assert "排程已更新" in bot_harness.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_text_input_validates_and_persists_price(bot_harness):
+    bot_harness.store.toggle_region(3)
+
+    bot_harness.context.user_data["awaiting"] = ("price", 3)
+    bot_harness.message.text = "not a range"
+    await bot.text_input(bot_harness.update, bot_harness.context)
+    assert bot_harness.context.user_data["awaiting"] == ("price", 3)
+    assert "請輸入兩個數值" in bot_harness.message.reply_text.await_args.args[0]
+
+    bot_harness.context.user_data["awaiting"] = ("price", 3)
+    bot_harness.message.text = "30000 10000"
+    await bot.text_input(bot_harness.update, bot_harness.context)
+    assert bot_harness.context.user_data["awaiting"] == ("price", 3)
+    assert "租金範圍無效" in bot_harness.message.reply_text.await_args.args[0]
+
+    bot_harness.context.user_data["awaiting"] = ("price", 3)
+    bot_harness.message.text = "10000 -"
+    await bot.text_input(bot_harness.update, bot_harness.context)
+    assert bot_harness.store.load()["crawl"][0]["price"] == {"min": 10000}
+    assert "租金範圍已更新" in bot_harness.message.reply_text.await_args.args[0]
+
+
+@pytest.mark.asyncio
 async def test_enqueue_crawl_is_atomic_and_does_not_queue_a_second_run(monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()
@@ -164,3 +686,239 @@ async def test_enqueue_crawl_is_atomic_and_does_not_queue_a_second_run(monkeypat
     assert await first == 123
     await asyncio.sleep(0)
     assert application.bot_data["crawl_task"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_view_handles_empty_and_ambiguous_rows(monkeypatch):
+    monkeypatch.setattr(bot, "_pending_rows", lambda store: [])
+    text, keyboard = await bot._pending_view(MagicMock())
+    assert "沒有結果不明" in text
+    assert keyboard.inline_keyboard[0][0].callback_data == "home"
+
+    monkeypatch.setattr(
+        bot,
+        "_pending_rows",
+        lambda store: [{"region_id": 3, "region": "新北市", "listing_id": "abc"}],
+    )
+    text, keyboard = await bot._pending_view(MagicMock())
+    assert "新北市 #abc" in text
+    assert keyboard.inline_keyboard[0][0].callback_data == "delivery:sent:3:abc"
+    assert keyboard.inline_keyboard[0][1].callback_data == "delivery:retry:3:abc"
+
+
+def test_pending_database_helpers_close_connections(bot_harness, monkeypatch):
+    connection = MagicMock()
+    monkeypatch.setattr(bot, "init_db", MagicMock(return_value=connection))
+    monkeypatch.setattr(
+        bot,
+        "ambiguous_deliveries",
+        MagicMock(return_value=[{"listing_id": "abc"}]),
+    )
+    monkeypatch.setattr(bot, "resolve_ambiguous_delivery", MagicMock(return_value=True))
+
+    assert bot._pending_rows(bot_harness.store) == [{"listing_id": "abc"}]
+    assert bot.ambiguous_deliveries.call_args.kwargs == {"limit": 5}
+    assert bot._resolve_pending(bot_harness.store, 3, "abc", True)
+    assert bot.resolve_ambiguous_delivery.call_args.kwargs["delivered"] is True
+    assert connection.close.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_handles_missing_binding_and_empty_configuration(
+    bot_harness, caplog
+):
+    data = bot_harness.store.load()
+    data["telegram"]["chat_id"] = None
+    bot_harness.store.save(data)
+    assert await bot._run_crawler(bot_harness.application) is None
+    assert "尚未有 Telegram 對話" in caplog.text
+
+    bot_harness.store.bind_owner(123, 123)
+    assert await bot._run_crawler(bot_harness.application, 123) is None
+    bot_harness.application.bot.send_message.assert_awaited_once_with(
+        123, "尚未啟用任何縣市。"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore:Deprecated since version v22.2")
+async def test_run_crawler_retries_telegram_and_reports_summary(
+    bot_harness, monkeypatch
+):
+    bot_harness.store.toggle_region(3)
+    summary = {
+        "notified": 1,
+        "skipped": 2,
+        "failed": 0,
+        "ambiguous": 0,
+        "parse_failed": 0,
+    }
+
+    async def fake_crawl(config_path, notify):
+        receipt = await notify(
+            "新北市",
+            {
+                "id": "abc",
+                "title": "Listing",
+                "price": "10,000元/月",
+                "location": "土城區",
+            },
+        )
+        assert receipt == {"chat_id": 123, "message_id": 456}
+        return summary
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+    monkeypatch.setattr(bot.asyncio, "sleep", sleep)
+    bot_harness.application.bot.send_message.side_effect = [
+        bot.RetryAfter(timedelta(0)),
+        SimpleNamespace(message_id=456),
+        None,
+    ]
+
+    result = await bot._run_crawler(bot_harness.application, 123)
+
+    assert result == summary
+    sleep.assert_awaited_once_with(0.25)
+    completion = bot_harness.application.bot.send_message.await_args_list[-1].args[1]
+    assert "已通知 1 筆" in completion
+    assert "已傳送過 2 筆" in completion
+
+
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore:Deprecated since version v22.2")
+async def test_run_crawler_reports_exception_and_final_retry_failure(
+    bot_harness, monkeypatch
+):
+    bot_harness.store.toggle_region(3)
+
+    async def failing_crawl(config_path, notify):
+        await notify("新北市", {"id": "abc"})
+
+    monkeypatch.setattr(bot, "crawl_and_notify", failing_crawl)
+    monkeypatch.setattr(bot.asyncio, "sleep", AsyncMock())
+    bot_harness.application.bot.send_message.side_effect = [
+        bot.RetryAfter(timedelta(0)),
+        bot.RetryAfter(timedelta(0)),
+        bot.RetryAfter(timedelta(0)),
+        None,
+    ]
+
+    assert await bot._run_crawler(bot_harness.application, 123) is None
+    assert bot_harness.application.bot.send_message.await_args_list[-1].args == (
+        123,
+        "爬蟲執行失敗，請查看容器日誌。",
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduled_crawl_enqueues_without_status_chat(bot_harness, monkeypatch):
+    enqueue = MagicMock()
+    monkeypatch.setattr(bot, "enqueue_crawl", enqueue)
+
+    await bot.scheduled_crawl(bot_harness.context)
+
+    enqueue.assert_called_once_with(bot_harness.application)
+
+
+@pytest.mark.asyncio
+async def test_post_init_and_shutdown_manage_bot_lifecycle(bot_harness, monkeypatch):
+    reschedule = MagicMock()
+    monkeypatch.setattr(bot, "reschedule", reschedule)
+    lock = MagicMock()
+    bot_harness.application.bot_data["instance_lock"] = lock
+
+    await bot.post_init(bot_harness.application)
+    commands = bot_harness.application.bot.set_my_commands.await_args.args[0]
+    assert [command.command for command in commands] == [
+        "start",
+        "menu",
+        "crawl",
+        "pending",
+    ]
+    reschedule.assert_called_once_with(bot_harness.application)
+
+    await bot.post_shutdown(bot_harness.application)
+    lock.close.assert_called_once_with()
+    bot_harness.application.bot_data["instance_lock"] = None
+    await bot.post_shutdown(bot_harness.application)
+
+
+def test_build_application_registers_handlers_and_releases_lock(tmp_path):
+    application = bot.build_application(
+        "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        tmp_path / "config.yaml",
+        allowed_user_id=123,
+    )
+    try:
+        assert application.bot_data["allowed_user_id"] == 123
+        assert application.bot_data["crawl_task"] is None
+        assert len(application.handlers[0]) == 6
+    finally:
+        application.bot_data["instance_lock"].close()
+
+
+def test_build_application_rejects_mismatched_existing_owner(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "telegram: {owner_user_id: 456, chat_id: 456}\ncrawl: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="owner_user_id"):
+        bot.build_application(
+            "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            path,
+            allowed_user_id=123,
+        )
+
+
+def test_build_application_closes_lock_when_telegram_builder_fails(
+    tmp_path, monkeypatch
+):
+    lock = MagicMock()
+    monkeypatch.setattr(ConfigStore, "acquire_instance_lock", lambda self: lock)
+    builder = MagicMock()
+    builder.token.return_value = builder
+    builder.post_init.return_value = builder
+    builder.post_shutdown.return_value = builder
+    builder.build.side_effect = RuntimeError("builder failed")
+    monkeypatch.setattr(bot, "ApplicationBuilder", lambda: builder)
+
+    with pytest.raises(RuntimeError, match="builder failed"):
+        bot.build_application(
+            "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            tmp_path / "config.yaml",
+            allowed_user_id=123,
+        )
+    lock.close.assert_called_once_with()
+
+
+def test_main_requires_token(monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
+        bot.main()
+
+
+def test_main_builds_and_runs_polling(monkeypatch):
+    application = SimpleNamespace(run_polling=MagicMock())
+    build = MagicMock(return_value=application)
+    monkeypatch.setattr(bot, "build_application", build)
+    monkeypatch.setenv(
+        "TELEGRAM_BOT_TOKEN",
+        "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    )
+    monkeypatch.setenv("CONFIG_PATH", "/tmp/test-config.yaml")
+    monkeypatch.setenv("CONFIG_TEMPLATE_PATH", "/tmp/template.yaml")
+
+    bot.main()
+
+    build.assert_called_once_with(
+        "0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "/tmp/test-config.yaml",
+        "/tmp/template.yaml",
+    )
+    application.run_polling.assert_called_once_with(
+        allowed_updates=bot.Update.ALL_TYPES
+    )

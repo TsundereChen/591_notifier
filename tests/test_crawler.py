@@ -7,6 +7,7 @@ Integration tests hit the live site and are skipped by default; run them with:
 """
 
 import json
+import ssl
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
@@ -15,11 +16,13 @@ import pytest
 import requests
 from bs4 import BeautifulSoup
 
+from rent591_notifier import crawler
 from rent591_notifier.crawler import (
     KINDS,
     REGIONS,
     SECTIONS,
     CrawlerParseError,
+    _CompatibilityTLSAdapter,
     _http_get,
     _parse_detail,
     _parse_item,
@@ -35,6 +38,25 @@ from rent591_notifier.crawler import (
 FIXTURES = Path(__file__).parent / "fixtures"
 FIXTURE_HTML = (FIXTURES / "list_page.html").read_text(encoding="utf-8")
 DETAIL_FIXTURE_HTML = (FIXTURES / "detail_page.html").read_text(encoding="utf-8")
+
+
+def test_compatibility_tls_adapter_keeps_verification_enabled():
+    adapter = _CompatibilityTLSAdapter()
+    context = adapter.poolmanager.connection_pool_kw["ssl_context"]
+
+    assert context.check_hostname
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    strict = getattr(ssl, "VERIFY_X509_STRICT", 0)
+    if strict:
+        assert not context.verify_flags & strict
+
+
+def test_compatibility_tls_adapter_supports_python_without_strict_flag(monkeypatch):
+    monkeypatch.delattr(crawler.ssl, "VERIFY_X509_STRICT")
+
+    adapter = _CompatibilityTLSAdapter()
+
+    assert adapter.poolmanager.connection_pool_kw["ssl_context"].check_hostname
 
 
 def parse_fixture_items():
