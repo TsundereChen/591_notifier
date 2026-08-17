@@ -91,5 +91,5 @@ pytest -m integration
 
 GitHub Actions 會執行 Black、Python 3.13/3.14 測試與容器 smoke test；全部通過
 後才發布 `linux/amd64`、`linux/arm64` 映像至
-`ghcr.io/tsunderechen/591_notifier`。每日排程與手動 workflow 也會執行 591
-實站測試。
+`ghcr.io/tsunderechen/591_notifier`。591 實站測試僅供本機需要時手動執行，不會在
+GitHub Actions 中執行。

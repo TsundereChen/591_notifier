@@ -4,8 +4,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "17 2 * * *"
 
 permissions:
   contents: read
@@ -35,20 +33,6 @@ jobs:
       # Integration tests hit the live 591 site; pytest.ini excludes them here.
       - name: Run unit tests
         run: pytest -v
-
-  live-integration:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.13"
-          cache: pip
-      - run: pip install -r requirements-dev.txt
-      - name: Run live 591 integration tests
-        run: pytest -v -m integration
 
   container-test:
     needs: test
