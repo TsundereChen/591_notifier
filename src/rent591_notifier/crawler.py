@@ -858,6 +858,52 @@ def _label_value_pairs(container, item_sel, label_sel, value_sel):
     return pairs
 
 
+def _image_urls_from_value(value):
+    """Extract absolute image URLs from one schema.org image value."""
+    if isinstance(value, str):
+        return [value] if value.startswith(("https://", "http://")) else []
+    if isinstance(value, list):
+        urls = []
+        for item in value:
+            for url in _image_urls_from_value(item):
+                if url not in urls:
+                    urls.append(url)
+        return urls
+    if isinstance(value, dict):
+        urls = []
+        for key in ("contentUrl", "url"):
+            for url in _image_urls_from_value(value.get(key)):
+                if url not in urls:
+                    urls.append(url)
+        return urls
+    return []
+
+
+def _structured_album_images(soup):
+    """Return the largest image collection embedded in JSON-LD metadata."""
+    candidates = []
+
+    def visit(value):
+        if isinstance(value, dict):
+            if "image" in value:
+                images = _image_urls_from_value(value["image"])
+                if images:
+                    candidates.append(images)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.string or script.get_text() or "")
+        except (TypeError, ValueError):
+            continue
+        visit(data)
+    return max(candidates, key=len, default=[])
+
+
 def _parse_detail(soup, url):
     """Parse one rent detail page into a dict."""
     detail = {"url": url}
@@ -928,14 +974,18 @@ def _parse_detail(soup, url):
     )
     detail["poster_info"] = _text(soup.select_one("section.contact div.company-info p"))
 
-    images = []
-    for img in soup.select("section.album img"):
-        for attr in ("data-src", "src"):
-            src = img.get(attr) or ""
-            if src.startswith("http"):
-                if src not in images:
-                    images.append(src)
-                break
+    # The visible album renders only five preview images. The complete album is
+    # available in schema.org JSON-LD, so prefer that collection and retain the
+    # DOM previews as a fallback for older page variants.
+    images = _structured_album_images(soup)
+    if not images:
+        for img in soup.select("section.album img"):
+            for attr in ("data-src", "src"):
+                src = img.get(attr) or ""
+                if src.startswith("http"):
+                    if src not in images:
+                        images.append(src)
+                    break
     detail["images"] = images
 
     return detail

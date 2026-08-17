@@ -507,6 +507,25 @@ class TestParseDetail:
             "https://img1.591.com.tw/house/2026/08/10/178634320492218005.jpg!1000x.water2.jpg",
         ]
 
+    def test_images_prefer_complete_json_ld_album_over_five_dom_previews(self):
+        images = [f"https://img.591.com.tw/{index}.jpg" for index in range(12)]
+        structured = json.dumps(
+            {"@context": "https://schema.org", "@graph": [{"image": images}]}
+        )
+        previews = "".join(
+            f'<img data-src="https://preview.591.com.tw/{index}.jpg">'
+            for index in range(5)
+        )
+        soup = BeautifulSoup(
+            f'<script type="application/ld+json">{structured}</script>'
+            f'<section class="album">{previews}</section>',
+            "html.parser",
+        )
+
+        detail = _parse_detail(soup, "https://rent.591.com.tw/123")
+
+        assert detail["images"] == images
+
     def test_id_from_unparseable_url_is_none(self):
         d = self._parse(url="https://example.com/foo")
         assert d["id"] is None
