@@ -66,6 +66,14 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
         "failed": 1,
         "ambiguous": 1,
         "parse_failed": 0,
+        "regions": [
+            {
+                "region": "新北市",
+                "crawled": 3,
+                "matched": 1,
+                "pushed": 1,
+            }
+        ],
     }
     conn = init_db(db_path)
     assert listing_exists(conn, 3, "new")
@@ -115,6 +123,32 @@ async def test_maximum_thirty_results_per_county(tmp_path):
     conn.close()
     assert count == 30
     assert region_values == [("新北市",)]
+
+
+@pytest.mark.asyncio
+async def test_summary_includes_each_countys_crawled_matched_and_pushed_items(tmp_path):
+    config_path, db_path = write_config(
+        tmp_path, "  - region: 新北市\n  - region: 台北市\n"
+    )
+    conn = init_db(db_path, [3, 1])
+    insert_notified_listing(conn, listing("matched"), 3, "before")
+    conn.close()
+
+    async def notify(_, __):
+        return None
+
+    def crawl(**kwargs):
+        if kwargs["region"] == 3:
+            return payload("新北市", [listing("matched"), listing("new")])
+        return payload("台北市", [listing("taipei-new")])
+
+    with mock.patch("rent591_notifier.notifier.crawl_rent_list", side_effect=crawl):
+        summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    assert summary["regions"] == [
+        {"region": "新北市", "crawled": 2, "matched": 1, "pushed": 1},
+        {"region": "台北市", "crawled": 1, "matched": 0, "pushed": 1},
+    ]
 
 
 @pytest.mark.asyncio

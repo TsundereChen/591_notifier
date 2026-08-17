@@ -17,6 +17,7 @@ from rent591_notifier.bot import (
     _authorized,
     _config_summary,
     _cron_trigger,
+    _format_crawl_summary,
     _format_schedule,
     _home_view,
     _listing_message,
@@ -280,6 +281,17 @@ async def test_send_listing_uses_photo_or_media_group():
     ]
     assert [item.caption for item in media] == ["listing text", None]
     telegram_bot.send_message.assert_not_awaited()
+
+
+def test_crawl_summary_lists_each_countys_requested_counts():
+    assert _format_crawl_summary(
+        {
+            "regions": [
+                {"region": "新北市", "crawled": 3, "matched": 2, "pushed": 1},
+                {"region": "台北市", "crawled": 1, "matched": 0, "pushed": 1},
+            ]
+        }
+    ) == ("爬蟲執行完成：\n" "新北市：總爬取 3 筆、已匹配 2 筆、新推送 1 筆\n" "台北市：總爬取 1 筆、已匹配 0 筆、新推送 1 筆")
 
 
 def test_config_summary_is_structured_and_human_readable():
@@ -842,6 +854,7 @@ async def test_run_crawler_retries_telegram_and_reports_summary(
         "failed": 0,
         "ambiguous": 0,
         "parse_failed": 0,
+        "regions": [{"region": "新北市", "crawled": 3, "matched": 2, "pushed": 1}],
     }
 
     async def fake_crawl(config_path, notify):
@@ -871,8 +884,25 @@ async def test_run_crawler_retries_telegram_and_reports_summary(
     assert result == summary
     sleep.assert_awaited_once_with(0.25)
     completion = bot_harness.application.bot.send_message.await_args_list[-1].args[1]
-    assert "已通知 1 筆" in completion
-    assert "已傳送過 2 筆" in completion
+    assert "新北市：總爬取 3 筆、已匹配 2 筆、新推送 1 筆" in completion
+
+
+@pytest.mark.asyncio
+async def test_scheduled_run_sends_summary_to_bound_chat(bot_harness, monkeypatch):
+    bot_harness.store.toggle_region(3)
+    summary = {
+        "regions": [{"region": "新北市", "crawled": 2, "matched": 1, "pushed": 1}]
+    }
+
+    async def fake_crawl(config_path, notify):
+        return summary
+
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+
+    assert await bot._run_crawler(bot_harness.application) == summary
+    bot_harness.application.bot.send_message.assert_awaited_once_with(
+        123, "爬蟲執行完成：\n新北市：總爬取 2 筆、已匹配 1 筆、新推送 1 筆"
+    )
 
 
 @pytest.mark.asyncio

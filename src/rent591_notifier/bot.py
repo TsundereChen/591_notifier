@@ -556,6 +556,17 @@ async def _send_listing(bot, chat_id, text, images):
     )
 
 
+def _format_crawl_summary(summary):
+    """Format the per-county result report sent after each crawl."""
+    lines = ["爬蟲執行完成："]
+    for region in summary.get("regions", []):
+        lines.append(
+            f"{region['region']}：總爬取 {region['crawled']} 筆、"
+            f"已匹配 {region['matched']} 筆、新推送 {region['pushed']} 筆"
+        )
+    return "\n".join(lines)
+
+
 def _pending_rows(store):
     data = store.load()
     db_path = resolve_database_path(store.path, data["database"])
@@ -651,13 +662,10 @@ async def _run_crawler(application, status_chat_id=None):
             error_chat_id, "爬蟲執行失敗，請查看容器日誌。"
         )
         return None
-    if status_chat_id:
+    report_chat_id = status_chat_id or chat_id
+    if report_chat_id:
         await application.bot.send_message(
-            status_chat_id,
-            "爬蟲執行完成："
-            f"已通知 {summary['notified']} 筆、已傳送過 {summary['skipped']} 筆、"
-            f"失敗 {summary['failed']} 筆、結果不明 {summary['ambiguous']} 筆、"
-            f"解析失敗 {summary['parse_failed']} 筆。",
+            report_chat_id, _format_crawl_summary(summary)
         )
     return summary
 

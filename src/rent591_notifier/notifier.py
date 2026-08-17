@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from .crawler import crawl_rent_list
+from .crawler import REGIONS, crawl_rent_list
 from .database import (
     init_db,
     insert_notified_listing,
@@ -43,7 +43,7 @@ async def crawl_and_notify(
     config_path,
     notify: Callable[[str, dict[str, Any]], Awaitable[Any]],
     run_in_thread: bool = True,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Notify at most 30 IDs per county, with durable duplicate suppression.
 
     A minimal delivery reservation is committed before contacting Telegram. If
@@ -65,11 +65,19 @@ async def crawl_and_notify(
         "failed": 0,
         "ambiguous": 0,
         "parse_failed": 0,
+        "regions": [],
     }
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     try:
         for job in config["jobs"]:
             region_id = job["region_id"]
+            region_summary = {
+                "region": REGIONS[region_id],
+                "crawled": 0,
+                "matched": 0,
+                "pushed": 0,
+            }
+            summary["regions"].append(region_summary)
             kwargs = {
                 "region": region_id,
                 "sections": job["section_ids"] or None,
@@ -99,6 +107,7 @@ async def crawl_and_notify(
                     break
 
             summary["fetched"] += len(page)
+            region_summary["crawled"] = len(page)
             existing = await _sync_call(
                 run_in_thread,
                 notified_listing_ids,
@@ -111,6 +120,7 @@ async def crawl_and_notify(
                 listing_id = str(listing["id"])
                 if listing_id in existing:
                     summary["skipped"] += 1
+                    region_summary["matched"] += 1
                     continue
 
                 reservation = await _sync_call(
@@ -118,6 +128,7 @@ async def crawl_and_notify(
                 )
                 if reservation == "sent":
                     summary["skipped"] += 1
+                    region_summary["matched"] += 1
                     continue
                 if reservation == "ambiguous":
                     summary["ambiguous"] += 1
@@ -179,6 +190,7 @@ async def crawl_and_notify(
                     summary["ambiguous"] += 1
                     continue
                 summary["notified"] += 1
+                region_summary["pushed"] += 1
     finally:
         await _sync_call(run_in_thread, conn.close)
     return summary

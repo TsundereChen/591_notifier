@@ -9,6 +9,7 @@
 - 每筆通知會從物件詳情頁載入照片，並以 Telegram 相簿傳送最多 10 張。
 - 每個縣市使用獨立 SQLite 資料表。
 - 只有 Telegram 接受通知後才保存完整物件資料。
+- 每次排程爬取完成後，Telegram 會回報各縣市的爬取、已匹配與新推送筆數。
 - 使用 `TELEGRAM_ALLOWED_USER_ID` 限制單一擁有者與私人聊天室。
 - 支援自訂五欄式 cron、Docker 與 amd64/arm64 映像。
 
