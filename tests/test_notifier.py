@@ -12,7 +12,12 @@ from rent591_notifier.database import (
     insert_notified_listing,
     listing_exists,
 )
-from rent591_notifier.notifier import MAX_RESULTS_PER_REGION, crawl_and_notify
+from rent591_notifier.notifier import (
+    MAX_RESULTS_PER_REGION,
+    PAGES_PER_REGION,
+    RESULTS_PER_PAGE,
+    crawl_and_notify,
+)
 
 
 def write_config(tmp_path, crawl):
@@ -65,16 +70,23 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
         "skipped": 1,
         "failed": 1,
         "ambiguous": 1,
+        "retried": 0,
         "parse_failed": 0,
         "regions": [
             {
                 "region": "新北市",
                 "crawled": 3,
+                "processed": 3,
+                "retried": 0,
                 "matched": 1,
                 "pushed": 1,
+                "failed": 1,
             }
         ],
     }
+    assert summary["regions"][0]["processed"] == sum(
+        summary["regions"][0][key] for key in ("matched", "pushed", "failed")
+    )
     conn = init_db(db_path)
     assert listing_exists(conn, 3, "new")
     assert not listing_exists(conn, 3, "failed")
@@ -88,40 +100,60 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
 
     with mock.patch("rent591_notifier.notifier.crawl_rent_list", return_value=response):
         second = await crawl_and_notify(config_path, retry, run_in_thread=False)
-    assert retried == []
-    assert second["notified"] == 0
+    assert retried == ["failed"]
+    assert second["notified"] == 1
     assert second["skipped"] == 2
-    assert second["ambiguous"] == 1
+    assert second["ambiguous"] == 0
+    assert second["regions"] == [
+        {
+            "region": "新北市",
+            "crawled": 3,
+            "processed": 3,
+            "retried": 1,
+            "matched": 2,
+            "pushed": 1,
+            "failed": 0,
+        }
+    ]
 
 
 @pytest.mark.asyncio
-async def test_maximum_thirty_results_per_county(tmp_path):
+async def test_crawls_five_pages_and_processes_at_most_150_results_per_county(
+    tmp_path,
+):
     config_path, db_path = write_config(
         tmp_path,
         "  - region: 新北市\n    sections: [土城區, 中和區]\n",
     )
-    first = [listing(f"a{i}") for i in range(40)]
     notified = []
 
     async def notify(_, item):
         notified.append(item["id"])
 
+    def crawl_page(**kwargs):
+        page_number = kwargs["page"]
+        items = [
+            listing(f"p{page_number}-{index}") for index in range(RESULTS_PER_PAGE + 10)
+        ]
+        return payload("新北市", items)
+
     with mock.patch(
-        "rent591_notifier.notifier.crawl_rent_list",
-        return_value=payload("新北市", first),
+        "rent591_notifier.notifier.crawl_rent_list", side_effect=crawl_page
     ) as crawl:
         summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
 
-    assert crawl.call_count == 1
-    assert len(notified) == MAX_RESULTS_PER_REGION == 30
-    assert summary["fetched"] == 30
+    assert [call.kwargs["page"] for call in crawl.call_args_list] == list(
+        range(1, PAGES_PER_REGION + 1)
+    )
+    assert len(notified) == MAX_RESULTS_PER_REGION == 150
+    assert summary["fetched"] == 150
     conn = sqlite3.connect(db_path)
     count = conn.execute("SELECT count(*) FROM 'listings_新北市'").fetchone()[0]
     region_values = conn.execute(
         "SELECT DISTINCT region FROM 'listings_新北市'"
     ).fetchall()
     conn.close()
-    assert count == 30
+    assert count == 150
     assert region_values == [("新北市",)]
 
 
@@ -146,9 +178,84 @@ async def test_summary_includes_each_countys_crawled_matched_and_pushed_items(tm
         summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
 
     assert summary["regions"] == [
-        {"region": "新北市", "crawled": 2, "matched": 1, "pushed": 1},
-        {"region": "台北市", "crawled": 1, "matched": 0, "pushed": 1},
+        {
+            "region": "新北市",
+            "crawled": 2,
+            "processed": 2,
+            "retried": 0,
+            "matched": 1,
+            "pushed": 1,
+            "failed": 0,
+        },
+        {
+            "region": "台北市",
+            "crawled": 1,
+            "processed": 1,
+            "retried": 0,
+            "matched": 0,
+            "pushed": 1,
+            "failed": 0,
+        },
     ]
+
+
+@pytest.mark.asyncio
+async def test_pending_delivery_retries_after_it_drops_out_of_crawled_page(tmp_path):
+    config_path, db_path = write_config(tmp_path, "  - region: 新北市\n")
+    attempts = []
+
+    async def notify(_, item):
+        attempts.append(item["id"])
+        if len(attempts) == 1:
+            raise RuntimeError("temporary failure")
+
+    responses = [payload("新北市", [listing("gone")])] * PAGES_PER_REGION
+    responses += [payload("新北市", [])] * PAGES_PER_REGION
+    with mock.patch("rent591_notifier.notifier.crawl_rent_list", side_effect=responses):
+        first = await crawl_and_notify(config_path, notify, run_in_thread=False)
+        second = await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    assert first["regions"][0]["failed"] == 1
+    assert second["regions"] == [
+        {
+            "region": "新北市",
+            "crawled": 0,
+            "processed": 1,
+            "retried": 1,
+            "matched": 0,
+            "pushed": 1,
+            "failed": 0,
+        }
+    ]
+    assert attempts == ["gone", "gone"]
+    conn = init_db(db_path)
+    assert delivery_status(conn, 3, "gone") == "sent"
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_failure_bookkeeping_error_does_not_abort_remaining_listings(tmp_path):
+    config_path, _ = write_config(tmp_path, "  - region: 新北市\n")
+    response = payload("新北市", [listing("failed"), listing("next")])
+    attempted = []
+
+    async def notify(_, item):
+        attempted.append(item["id"])
+        if item["id"] == "failed":
+            raise RuntimeError("Telegram unavailable")
+
+    with (
+        mock.patch("rent591_notifier.notifier.crawl_rent_list", return_value=response),
+        mock.patch(
+            "rent591_notifier.notifier.mark_delivery_ambiguous",
+            side_effect=sqlite3.OperationalError("temporarily locked"),
+        ),
+    ):
+        summary = await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    assert attempted == ["failed", "next"]
+    assert summary["regions"][0]["failed"] == 1
+    assert summary["regions"][0]["pushed"] == 1
 
 
 @pytest.mark.asyncio
@@ -171,7 +278,7 @@ async def test_duplicate_result_within_page_is_considered_once(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_send_then_database_failure_is_never_automatically_resent(tmp_path):
+async def test_send_then_database_failure_is_retried_on_next_crawl(tmp_path):
     config_path, db_path = write_config(tmp_path, "  - region: 新北市\n")
     response = payload("新北市", [listing("uncertain")])
     sent = []
@@ -195,12 +302,14 @@ async def test_send_then_database_failure_is_never_automatically_resent(tmp_path
 
     with mock.patch("rent591_notifier.notifier.crawl_rent_list", return_value=response):
         second = await crawl_and_notify(config_path, notify, run_in_thread=False)
-    assert second["ambiguous"] == 1
-    assert sent == ["uncertain"]
+    assert second["notified"] == 1
+    assert second["ambiguous"] == 0
+    assert second["regions"][0]["pushed"] == 1
+    assert sent == ["uncertain", "uncertain"]
 
     conn = init_db(db_path)
-    assert delivery_status(conn, 3, "uncertain") == "ambiguous"
-    assert not listing_exists(conn, 3, "uncertain")
+    assert delivery_status(conn, 3, "uncertain") == "sent"
+    assert listing_exists(conn, 3, "uncertain")
     conn.close()
 
 

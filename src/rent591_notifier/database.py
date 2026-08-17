@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,16 @@ from .crawler import (
 )
 
 DEFAULT_DB = "listings.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+@dataclass(frozen=True)
+class DeliveryReservation:
+    """Result of reserving one delivery attempt."""
+
+    status: str
+    attempt_count: int | None = None
+
 
 BASE_LISTING_COLUMNS = (
     "id",
@@ -89,6 +99,9 @@ CREATE TABLE IF NOT EXISTS delivery_attempts (
     updated_at          TEXT NOT NULL,
     telegram_chat_id    INTEGER,
     telegram_message_id INTEGER,
+    payload             TEXT,
+    attempt_count       INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT,
     PRIMARY KEY (region_id, listing_id)
 )
 """
@@ -120,6 +133,22 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+def _ensure_delivery_columns(conn: sqlite3.Connection) -> None:
+    """Upgrade an existing delivery ledger without discarding retry state."""
+    columns = _table_columns(conn, "delivery_attempts")
+    additions = {
+        "payload": "TEXT",
+        "attempt_count": "INTEGER NOT NULL DEFAULT 0",
+        "last_error": "TEXT",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            conn.execute(
+                "ALTER TABLE delivery_attempts "
+                f"ADD COLUMN {_quote_identifier(name)} {declaration}"
+            )
+
+
 def _ensure_region_table(conn: sqlite3.Connection, region: int | str) -> str:
     """Create/upgrade and return the quoted listings table for one region."""
     table = _table_name(region)
@@ -128,8 +157,8 @@ def _ensure_region_table(conn: sqlite3.Connection, region: int | str) -> str:
     conn.execute(TABLE_SCHEMA.format(table=quoted))
 
     # Tables produced before notification tracking have no proof that their
-    # rows were delivered. Preserve them as unknown; reserve_delivery() exposes
-    # those rows through /pending instead of guessing and possibly resending.
+    # rows were delivered. Preserve them as unknown so reserve_delivery() can
+    # treat them as incomplete deliveries and retry them.
     if existed:
         columns = _table_columns(conn, table)
         additions = {
@@ -285,8 +314,10 @@ def load_config(path: str | os.PathLike[str]) -> dict[str, Any]:
         if unknown_price_keys:
             raise ValueError(f"unknown 'price' options: {sorted(unknown_price_keys)}")
         price_min, price_max = _validate_price_range(price.get("min"), price.get("max"))
-        if entry.get("pages", 1) != 1:
-            raise ValueError("'pages' is fixed at 1 (maximum 30 results per county)")
+        # `pages` is no longer configurable. Accept the former value for
+        # backward compatibility, but all runs now query five pages.
+        if entry.get("pages", 5) not in (1, 5):
+            raise ValueError("'pages' is fixed at 5 (maximum 150 results per county)")
         jobs.append(
             {
                 "region_id": region_id,
@@ -321,6 +352,7 @@ def init_db(
         with conn:
             _migrate_legacy_table(conn)
             conn.execute(DELIVERY_SCHEMA)
+            _ensure_delivery_columns(conn)
             for region in regions or []:
                 _ensure_region_table(conn, region)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -392,47 +424,61 @@ def reserve_delivery(
     region: int | str,
     listing_id: str | int,
     now: str,
-) -> str:
-    """Atomically reserve an ID; return reserved/sent/ambiguous."""
+    *,
+    listing: dict[str, Any] | None = None,
+) -> DeliveryReservation:
+    """Atomically reserve an ID, retrying incomplete attempts by default."""
     region_id = _resolve_region(region)
     listing_id = str(listing_id)
+    payload = json.dumps(listing, ensure_ascii=False) if listing is not None else None
     table = _quote_identifier(_table_name(region_id))
     listing_row = conn.execute(
         f"SELECT notification_status FROM {table} WHERE id = ?", (listing_id,)
     ).fetchone()
     if listing_row and listing_row[0] == "sent":
-        return "sent"
+        with conn:
+            conn.execute(
+                "UPDATE delivery_attempts SET status = 'sent', updated_at = ?, "
+                "last_error = NULL WHERE region_id = ? AND listing_id = ? "
+                "AND status != 'sent'",
+                (now, region_id, listing_id),
+            )
+        return DeliveryReservation("sent")
 
     with conn:
         row = conn.execute(
-            "SELECT status FROM delivery_attempts WHERE region_id = ? AND listing_id = ?",
+            "SELECT status, attempt_count FROM delivery_attempts "
+            "WHERE region_id = ? AND listing_id = ?",
             (region_id, listing_id),
         ).fetchone()
         if row:
             status = str(row[0])
-            if status == "sending":
-                conn.execute(
-                    "UPDATE delivery_attempts SET status = 'ambiguous', updated_at = ? "
-                    "WHERE region_id = ? AND listing_id = ?",
-                    (now, region_id, listing_id),
-                )
-                return "ambiguous"
-            return status
+            if status == "sent":
+                return DeliveryReservation("sent")
+            attempt_count = int(row[1]) + 1
+            conn.execute(
+                "UPDATE delivery_attempts SET status = 'sending', started_at = ?, "
+                "updated_at = ?, payload = COALESCE(?, payload), "
+                "attempt_count = ?, last_error = NULL "
+                "WHERE region_id = ? AND listing_id = ?",
+                (now, now, payload, attempt_count, region_id, listing_id),
+            )
+            return DeliveryReservation("reserved", attempt_count)
         if listing_row and listing_row[0] == "unknown":
             conn.execute(
                 "INSERT INTO delivery_attempts "
-                "(region_id, listing_id, status, started_at, updated_at) "
-                "VALUES (?, ?, 'ambiguous', ?, ?)",
-                (region_id, listing_id, now, now),
+                "(region_id, listing_id, status, started_at, updated_at, payload, "
+                "attempt_count) VALUES (?, ?, 'sending', ?, ?, ?, 1)",
+                (region_id, listing_id, now, now, payload),
             )
-            return "ambiguous"
+            return DeliveryReservation("reserved", 1)
         conn.execute(
             "INSERT INTO delivery_attempts "
-            "(region_id, listing_id, status, started_at, updated_at) "
-            "VALUES (?, ?, 'sending', ?, ?)",
-            (region_id, listing_id, now, now),
+            "(region_id, listing_id, status, started_at, updated_at, payload, "
+            "attempt_count) VALUES (?, ?, 'sending', ?, ?, ?, 1)",
+            (region_id, listing_id, now, now, payload),
         )
-    return "reserved"
+    return DeliveryReservation("reserved", 1)
 
 
 def mark_delivery_ambiguous(
@@ -440,14 +486,25 @@ def mark_delivery_ambiguous(
     region: int | str,
     listing_id: str | int,
     now: str,
-) -> None:
-    """Keep an uncertain send from being automatically attempted again."""
+    *,
+    attempt_count: int,
+    error: str,
+) -> bool:
+    """Record a failed/uncertain send for retry during the next crawl."""
     with conn:
-        conn.execute(
-            "UPDATE delivery_attempts SET status = 'ambiguous', updated_at = ? "
-            "WHERE region_id = ? AND listing_id = ?",
-            (now, _resolve_region(region), str(listing_id)),
+        cursor = conn.execute(
+            "UPDATE delivery_attempts SET status = 'ambiguous', updated_at = ?, "
+            "last_error = ? WHERE region_id = ? AND listing_id = ? "
+            "AND status = 'sending' AND attempt_count = ?",
+            (
+                now,
+                error[:500],
+                _resolve_region(region),
+                str(listing_id),
+                attempt_count,
+            ),
         )
+    return cursor.rowcount == 1
 
 
 def delivery_status(
@@ -463,10 +520,10 @@ def delivery_status(
 def ambiguous_deliveries(
     conn: sqlite3.Connection, *, limit: int = 20
 ) -> list[dict[str, Any]]:
-    """Return uncertain delivery IDs for explicit owner reconciliation."""
+    """Return completed uncertain attempts for explicit owner reconciliation."""
     rows = conn.execute(
-        "SELECT region_id, listing_id, status, started_at, updated_at "
-        "FROM delivery_attempts WHERE status IN ('sending', 'ambiguous') "
+        "SELECT region_id, listing_id, status, started_at, updated_at, "
+        "attempt_count, last_error FROM delivery_attempts WHERE status = 'ambiguous' "
         "ORDER BY updated_at LIMIT ?",
         (limit,),
     ).fetchall()
@@ -478,9 +535,46 @@ def ambiguous_deliveries(
             "status": str(row[2]),
             "started_at": str(row[3]),
             "updated_at": str(row[4]),
+            "attempt_count": int(row[5]),
+            "last_error": str(row[6]) if row[6] is not None else None,
         }
         for row in rows
     ]
+
+
+def retryable_deliveries(
+    conn: sqlite3.Connection, region: int | str
+) -> list[dict[str, Any]]:
+    """Return incomplete attempts, including sends interrupted by a crash."""
+    region_id = _resolve_region(region)
+    rows = conn.execute(
+        "SELECT listing_id, status, payload, attempt_count, started_at, updated_at "
+        "FROM delivery_attempts WHERE region_id = ? "
+        "AND status IN ('sending', 'ambiguous') ORDER BY updated_at",
+        (region_id,),
+    ).fetchall()
+    result = []
+    for row in rows:
+        listing = None
+        if row[2] is not None:
+            try:
+                candidate = json.loads(str(row[2]))
+            except (TypeError, ValueError):
+                candidate = None
+            if isinstance(candidate, dict):
+                listing = candidate
+        result.append(
+            {
+                "region_id": region_id,
+                "listing_id": str(row[0]),
+                "status": str(row[1]),
+                "listing": listing,
+                "attempt_count": int(row[3]),
+                "started_at": str(row[4]),
+                "updated_at": str(row[5]),
+            }
+        )
+    return result
 
 
 def resolve_ambiguous_delivery(
@@ -491,16 +585,17 @@ def resolve_ambiguous_delivery(
     delivered: bool,
     now: str,
 ) -> bool:
-    """Resolve an uncertain ID as delivered, or explicitly allow one retry."""
+    """Mark an ambiguous delivery as received or leave it queued for retry."""
     region_id = _resolve_region(region)
     listing_id = str(listing_id)
     table = _ensure_region_table(conn, region_id)
     with conn:
         if delivered:
             cursor = conn.execute(
-                "UPDATE delivery_attempts SET status = 'sent', updated_at = ? "
+                "UPDATE delivery_attempts SET status = 'sent', updated_at = ?, "
+                "last_error = NULL "
                 "WHERE region_id = ? AND listing_id = ? "
-                "AND status IN ('sending', 'ambiguous')",
+                "AND status = 'ambiguous'",
                 (now, region_id, listing_id),
             )
             if cursor.rowcount == 1:
@@ -512,19 +607,10 @@ def resolve_ambiguous_delivery(
                 )
         else:
             cursor = conn.execute(
-                "DELETE FROM delivery_attempts WHERE region_id = ? AND listing_id = ? "
-                "AND status IN ('sending', 'ambiguous')",
-                (region_id, listing_id),
+                "UPDATE delivery_attempts SET updated_at = ? "
+                "WHERE region_id = ? AND listing_id = ? AND status = 'ambiguous'",
+                (now, region_id, listing_id),
             )
-            if cursor.rowcount == 1:
-                # Legacy rows were stored before notification tracking existed.
-                # Once the owner explicitly permits a retry, remove that stale
-                # unproven row so the next crawl can reserve and send it.
-                conn.execute(
-                    f"DELETE FROM {table} "
-                    "WHERE id = ? AND notification_status = 'unknown'",
-                    (listing_id,),
-                )
     return cursor.rowcount == 1
 
 
@@ -567,6 +653,7 @@ def insert_notified_listing(
     *,
     telegram_chat_id: int | None = None,
     telegram_message_id: int | None = None,
+    attempt_count: int = 1,
 ) -> bool:
     """Atomically record a successful notification and finish its ledger row."""
     region_id = _resolve_region(region)
@@ -603,12 +690,15 @@ def insert_notified_listing(
         conn.execute(
             "INSERT INTO delivery_attempts "
             "(region_id, listing_id, status, started_at, updated_at, "
-            "telegram_chat_id, telegram_message_id) "
-            "VALUES (?, ?, 'sent', ?, ?, ?, ?) "
+            "telegram_chat_id, telegram_message_id, payload, attempt_count, last_error) "
+            "VALUES (?, ?, 'sent', ?, ?, ?, ?, ?, ?, NULL) "
             "ON CONFLICT(region_id, listing_id) DO UPDATE SET "
             "status = 'sent', updated_at = excluded.updated_at, "
             "telegram_chat_id = excluded.telegram_chat_id, "
-            "telegram_message_id = excluded.telegram_message_id",
+            "telegram_message_id = excluded.telegram_message_id, "
+            "payload = excluded.payload, "
+            "attempt_count = MAX(attempt_count, excluded.attempt_count), "
+            "last_error = NULL",
             (
                 region_id,
                 listing_id,
@@ -616,6 +706,8 @@ def insert_notified_listing(
                 now,
                 telegram_chat_id,
                 telegram_message_id,
+                json.dumps(listing, ensure_ascii=False),
+                attempt_count,
             ),
         )
     return not already_sent

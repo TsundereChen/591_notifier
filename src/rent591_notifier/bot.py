@@ -175,7 +175,7 @@ def _home_view(data):
         "591 租屋通知機器人\n\n"
         f"{_config_summary(data)}\n\n"
         "只有成功傳送通知的物件才會寫入資料庫。每次執行時，"
-        "每個縣市最多檢查 30 筆結果。"
+        "每個縣市最多檢查 5 頁、150 筆結果。"
     )
     keyboard = InlineKeyboardMarkup(
         [
@@ -547,10 +547,16 @@ async def _send_listing(bot, chat_id, text, images):
             InputMediaPhoto(media=image, caption=text if index == 0 else None)
             for index, image in enumerate(images[:MAX_IMAGES_PER_LISTING])
         ]
-        messages = await bot.send_media_group(chat_id=chat_id, media=media)
-        return messages[0]
+        try:
+            messages = await bot.send_media_group(chat_id=chat_id, media=media)
+            return messages[0]
+        except BadRequest:
+            LOGGER.warning("Telegram rejected listing album; retrying as text")
     if images:
-        return await bot.send_photo(chat_id=chat_id, photo=images[0], caption=text)
+        try:
+            return await bot.send_photo(chat_id=chat_id, photo=images[0], caption=text)
+        except BadRequest:
+            LOGGER.warning("Telegram rejected listing photo; retrying as text")
     return await bot.send_message(
         chat_id=chat_id, text=text, disable_web_page_preview=False
     )
@@ -560,9 +566,13 @@ def _format_crawl_summary(summary):
     """Format the per-county result report sent after each crawl."""
     lines = ["爬蟲執行完成："]
     for region in summary.get("regions", []):
+        processed = region.get("processed", region["crawled"])
+        retried = region.get("retried", 0)
         lines.append(
-            f"{region['region']}：總爬取 {region['crawled']} 筆、"
-            f"已匹配 {region['matched']} 筆、新推送 {region['pushed']} 筆"
+            f"{region['region']}：總處理 {processed} 筆"
+            f"（本次爬取 {region['crawled']} 筆、其中重試 {retried} 筆）、"
+            f"已匹配 {region['matched']} 筆、新推送 {region['pushed']} 筆、"
+            f"推送失敗 {region.get('failed', 0)} 筆"
         )
     return "\n".join(lines)
 
@@ -590,23 +600,22 @@ async def _pending_view(store):
     lines = [
         "結果不明通知",
         "",
-        "這些物件可能已由 Telegram 接受，但資料庫未完成確認。",
-        "請先查看聊天記錄，再選擇處理方式：",
+        "這些物件推送失敗或結果無法確認，下次爬蟲會自動重試。",
+        "若聊天記錄中已收到，可標記為已送達以避免重複：",
     ]
     for item in pending:
         region_id = item["region_id"]
         listing_id = item["listing_id"]
-        lines.extend(["", f"• {item['region']} #{listing_id}"])
+        detail = f"• {item['region']} #{listing_id}（已嘗試 {item.get('attempt_count', 0)} 次）"
+        if item.get("last_error"):
+            detail += f"\n  {str(item['last_error'])[:160]}"
+        lines.extend(["", detail])
         rows.append(
             [
                 InlineKeyboardButton(
                     "已收到，不再傳送",
                     callback_data=f"delivery:sent:{region_id}:{listing_id}",
-                ),
-                InlineKeyboardButton(
-                    "未收到，允許重試",
-                    callback_data=f"delivery:retry:{region_id}:{listing_id}",
-                ),
+                )
             ]
         )
     rows.append([InlineKeyboardButton("⬅️ 主選單", callback_data="home")])

@@ -11,8 +11,10 @@ from rent591_notifier.database import (
     insert_notified_listing,
     listing_exists,
     load_config,
+    mark_delivery_ambiguous,
     reserve_delivery,
     resolve_ambiguous_delivery,
+    retryable_deliveries,
 )
 
 
@@ -65,7 +67,7 @@ crawl:
         [
             ("database: rent.db\n", "non-empty 'crawl' list"),
             ("crawl: [{}]\n", "must define 'region'"),
-            ("crawl: [{region: 新北市, pages: 2}]\n", "fixed at 1"),
+            ("crawl: [{region: 新北市, pages: 2}]\n", "fixed at 5"),
             ("crawl: [{region: 新北市, price: [1, 2]}]\n", "must define"),
             ("crawl: [{region: 新北市, price: {min: 2, max: 1}}]\n", "greater"),
             ("database: ''\ncrawl: [{region: 新北市}]\n", "non-empty path"),
@@ -91,6 +93,40 @@ class TestDatabase:
 
         assert db_path.exists()
         assert {"id", "region", "section", "first_seen", "last_seen"} <= columns
+
+    def test_init_upgrades_existing_delivery_ledger_in_place(self, tmp_path):
+        db_path = tmp_path / "v2.db"
+        old = sqlite3.connect(db_path)
+        old.execute(
+            "CREATE TABLE delivery_attempts ("
+            "region_id INTEGER NOT NULL, listing_id TEXT NOT NULL, "
+            "status TEXT NOT NULL, started_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "telegram_chat_id INTEGER, telegram_message_id INTEGER, "
+            "PRIMARY KEY (region_id, listing_id))"
+        )
+        old.execute(
+            "INSERT INTO delivery_attempts VALUES "
+            "(3, '123', 'ambiguous', 'before', 'before', NULL, NULL)"
+        )
+        old.commit()
+        old.close()
+
+        conn = init_db(db_path, [3])
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(delivery_attempts)")
+        }
+
+        assert {"payload", "attempt_count", "last_error"} <= columns
+        assert retryable_deliveries(conn, 3)[0] == {
+            "region_id": 3,
+            "listing_id": "123",
+            "status": "ambiguous",
+            "listing": None,
+            "attempt_count": 0,
+            "started_at": "before",
+            "updated_at": "before",
+        }
+        conn.close()
 
     def test_init_migrates_combined_table_into_region_table(self, tmp_path):
         db_path = tmp_path / "old.db"
@@ -121,11 +157,7 @@ class TestDatabase:
         assert section == "土城區"
         assert old_table is None
         assert not listing_exists(conn, "新北市", "123")
-        assert reserve_delivery(conn, "新北市", "123", "review") == "ambiguous"
-        assert resolve_ambiguous_delivery(
-            conn, "新北市", "123", delivered=False, now="retry"
-        )
-        assert reserve_delivery(conn, "新北市", "123", "after-retry") == "reserved"
+        assert reserve_delivery(conn, "新北市", "123", "review").status == "reserved"
 
         listing = {"id": "123", "title": "A listing", "location": "土城區-中央路"}
         assert insert_notified_listing(conn, listing, "新北市", "after")
@@ -163,26 +195,61 @@ class TestDatabase:
             "2026-01-02T00:00:00",
         )
 
-    def test_interrupted_delivery_becomes_ambiguous_and_is_not_reserved_again(self):
+    def test_interrupted_delivery_is_reserved_again_for_automatic_retry(self):
         conn = init_db(":memory:", [3])
-        assert reserve_delivery(conn, 3, "123", "first") == "reserved"
-        assert reserve_delivery(conn, 3, "123", "second") == "ambiguous"
-        assert reserve_delivery(conn, 3, "123", "third") == "ambiguous"
-        assert delivery_status(conn, 3, "123") == "ambiguous"
-        assert ambiguous_deliveries(conn)[0]["listing_id"] == "123"
-        assert resolve_ambiguous_delivery(conn, 3, "123", delivered=False, now="fourth")
-        assert reserve_delivery(conn, 3, "123", "fifth") == "reserved"
+        first = reserve_delivery(
+            conn, 3, "123", "first", listing={"id": "123", "title": "Listing"}
+        )
+        assert ambiguous_deliveries(conn) == []
+        second = reserve_delivery(conn, 3, "123", "second")
+        assert (first.status, first.attempt_count) == ("reserved", 1)
+        assert (second.status, second.attempt_count) == ("reserved", 2)
+        assert delivery_status(conn, 3, "123") == "sending"
+        assert retryable_deliveries(conn, 3)[0]["listing"]["title"] == "Listing"
         conn.close()
 
     def test_owner_can_resolve_ambiguous_as_already_delivered(self):
         conn = init_db(":memory:", [3])
-        assert reserve_delivery(conn, 3, "123", "first") == "reserved"
-        assert reserve_delivery(conn, 3, "123", "second") == "ambiguous"
+        reservation = reserve_delivery(conn, 3, "123", "first")
+        assert mark_delivery_ambiguous(
+            conn,
+            3,
+            "123",
+            "second",
+            attempt_count=reservation.attempt_count,
+            error="timeout",
+        )
+        assert ambiguous_deliveries(conn)[0]["last_error"] == "timeout"
         assert resolve_ambiguous_delivery(conn, 3, "123", delivered=True, now="third")
-        assert reserve_delivery(conn, 3, "123", "fourth") == "sent"
+        assert not mark_delivery_ambiguous(
+            conn,
+            3,
+            "123",
+            "stale",
+            attempt_count=reservation.attempt_count,
+            error="late failure",
+        )
+        assert reserve_delivery(conn, 3, "123", "fourth").status == "sent"
+        assert ambiguous_deliveries(conn) == []
         conn.close()
 
-    def test_owner_marks_legacy_unknown_row_as_delivered(self):
+    def test_retry_decision_keeps_ambiguous_attempt_queued(self):
+        conn = init_db(":memory:", [3])
+        reservation = reserve_delivery(conn, 3, "123", "first")
+        mark_delivery_ambiguous(
+            conn,
+            3,
+            "123",
+            "second",
+            attempt_count=reservation.attempt_count,
+            error="timeout",
+        )
+
+        assert resolve_ambiguous_delivery(conn, 3, "123", delivered=False, now="third")
+        assert delivery_status(conn, 3, "123") == "ambiguous"
+        conn.close()
+
+    def test_legacy_unknown_row_is_reserved_for_automatic_retry(self):
         conn = init_db(":memory:", [3])
         conn.execute(
             'INSERT INTO "listings_新北市" '
@@ -191,10 +258,7 @@ class TestDatabase:
         )
         conn.commit()
 
-        assert reserve_delivery(conn, 3, "123", "first") == "ambiguous"
-        assert resolve_ambiguous_delivery(conn, 3, "123", delivered=True, now="second")
-        assert listing_exists(conn, 3, "123")
-        assert reserve_delivery(conn, 3, "123", "third") == "sent"
+        assert reserve_delivery(conn, 3, "123", "first").status == "reserved"
         conn.close()
 
     def test_legacy_conflict_preserves_combined_table(self, tmp_path):

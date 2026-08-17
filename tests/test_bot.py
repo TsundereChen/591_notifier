@@ -283,15 +283,50 @@ async def test_send_listing_uses_photo_or_media_group():
     telegram_bot.send_message.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_send_listing_falls_back_to_text_when_telegram_rejects_media():
+    telegram_bot = SimpleNamespace(
+        send_media_group=AsyncMock(side_effect=bot.BadRequest("bad album")),
+        send_photo=AsyncMock(side_effect=bot.BadRequest("bad photo")),
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=12)),
+    )
+
+    result = await _send_listing(
+        telegram_bot,
+        123,
+        "listing text",
+        ["https://img.591.com.tw/one.jpg", "https://img.591.com.tw/two.jpg"],
+    )
+
+    assert result.message_id == 12
+    telegram_bot.send_media_group.assert_awaited_once()
+    telegram_bot.send_photo.assert_awaited_once()
+    telegram_bot.send_message.assert_awaited_once_with(
+        chat_id=123, text="listing text", disable_web_page_preview=False
+    )
+
+
 def test_crawl_summary_lists_each_countys_requested_counts():
     assert _format_crawl_summary(
         {
             "regions": [
                 {"region": "新北市", "crawled": 3, "matched": 2, "pushed": 1},
-                {"region": "台北市", "crawled": 1, "matched": 0, "pushed": 1},
+                {
+                    "region": "台北市",
+                    "crawled": 2,
+                    "matched": 0,
+                    "pushed": 1,
+                    "failed": 1,
+                },
             ]
         }
-    ) == ("爬蟲執行完成：\n" "新北市：總爬取 3 筆、已匹配 2 筆、新推送 1 筆\n" "台北市：總爬取 1 筆、已匹配 0 筆、新推送 1 筆")
+    ) == (
+        "爬蟲執行完成：\n"
+        "新北市：總處理 3 筆（本次爬取 3 筆、其中重試 0 筆）、"
+        "已匹配 2 筆、新推送 1 筆、推送失敗 0 筆\n"
+        "台北市：總處理 2 筆（本次爬取 2 筆、其中重試 0 筆）、"
+        "已匹配 0 筆、新推送 1 筆、推送失敗 1 筆"
+    )
 
 
 def test_config_summary_is_structured_and_human_readable():
@@ -804,8 +839,9 @@ async def test_pending_view_handles_empty_and_ambiguous_rows(monkeypatch):
     )
     text, keyboard = await bot._pending_view(MagicMock())
     assert "新北市 #abc" in text
+    assert "下次爬蟲會自動重試" in text
     assert keyboard.inline_keyboard[0][0].callback_data == "delivery:sent:3:abc"
-    assert keyboard.inline_keyboard[0][1].callback_data == "delivery:retry:3:abc"
+    assert len(keyboard.inline_keyboard[0]) == 1
 
 
 def test_pending_database_helpers_close_connections(bot_harness, monkeypatch):
@@ -884,7 +920,7 @@ async def test_run_crawler_retries_telegram_and_reports_summary(
     assert result == summary
     sleep.assert_awaited_once_with(0.25)
     completion = bot_harness.application.bot.send_message.await_args_list[-1].args[1]
-    assert "新北市：總爬取 3 筆、已匹配 2 筆、新推送 1 筆" in completion
+    assert "新北市：總處理 3 筆（本次爬取 3 筆、其中重試 0 筆）" in completion
 
 
 @pytest.mark.asyncio
@@ -901,7 +937,10 @@ async def test_scheduled_run_sends_summary_to_bound_chat(bot_harness, monkeypatc
 
     assert await bot._run_crawler(bot_harness.application) == summary
     bot_harness.application.bot.send_message.assert_awaited_once_with(
-        123, "爬蟲執行完成：\n新北市：總爬取 2 筆、已匹配 1 筆、新推送 1 筆"
+        123,
+        "爬蟲執行完成：\n"
+        "新北市：總處理 2 筆（本次爬取 2 筆、其中重試 0 筆）、"
+        "已匹配 1 筆、新推送 1 筆、推送失敗 0 筆",
     )
 
 
