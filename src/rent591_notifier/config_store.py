@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import fcntl
+import logging
 import os
 import tempfile
 import threading
@@ -23,6 +24,8 @@ from .crawler import (
     _resolve_sections,
     _validate_price_range,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
     "database": "listings.db",
@@ -48,10 +51,12 @@ class InstanceLock:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             lock_file.close()
+            LOGGER.error("Notifier instance lock is already held path=%s", self.path)
             raise RuntimeError(
                 f"另一個 591 notifier 正在使用 {self.path.parent}；僅允許單一執行個體"
             ) from exc
         self._file = lock_file
+        LOGGER.info("Notifier instance lock acquired path=%s", self.path)
         return self
 
     def close(self) -> None:
@@ -95,6 +100,7 @@ class ConfigStore:
                 normalized = self._with_defaults(data)
                 if data != normalized:
                     self._save_unlocked(normalized)
+                    LOGGER.info("Normalized existing config path=%s", self.path)
                 else:
                     os.chmod(self.path, 0o600)
                 return
@@ -103,6 +109,7 @@ class ConfigStore:
             else:
                 data = copy.deepcopy(DEFAULT_CONFIG)
             self._save_unlocked(self._with_defaults(data))
+            LOGGER.info("Created config path=%s", self.path)
 
     @staticmethod
     def _optional_integer(value: Any, field: str) -> int | None:
@@ -216,6 +223,7 @@ class ConfigStore:
             mutator(data)
             data = self._with_defaults(data)
             self._save_unlocked(data)
+            LOGGER.info("Configuration updated path=%s", self.path)
             return copy.deepcopy(data)
 
     @staticmethod

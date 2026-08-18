@@ -68,6 +68,20 @@ crawl:
 
 可用指令：`/start`、`/menu`、`/crawl`、`/pending`。
 
+## 日誌與診斷
+
+容器日誌會為每次爬蟲建立 `run_id`，並記錄每一頁的來源筆數、已接受的唯一
+筆數、跨頁重複、無效資料、解析略過與是否不足 30 筆。這可直接解釋為何某縣市
+少於 150 筆。通知、重試、Telegram 限流、SQLite 寫入及未處理的 bot 例外也會帶有
+縣市、物件 ID 與嘗試次數；bot token 會被遮蔽。
+
+預設應用程式日誌為 `INFO`，但 `httpx`/`httpcore` 的成功請求會維持在 `WARNING`，
+避免輪詢訊息淹沒診斷資料。需要額外 HTTP 細節時可設定：
+
+```sh
+-e LOG_LEVEL=DEBUG -e HTTP_LOG_LEVEL=INFO
+```
+
 ## 本機開發
 
 ```sh

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 from collections.abc import Iterable, Sequence
@@ -22,6 +23,7 @@ from .crawler import (
 
 DEFAULT_DB = "listings.db"
 SCHEMA_VERSION = 3
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -337,6 +339,7 @@ def init_db(
     db_path: str | os.PathLike[str], regions: Iterable[int | str] | None = None
 ) -> sqlite3.Connection:
     """Open SQLite, run transactional migrations, and tune safe concurrency."""
+    regions = tuple(regions or ())
     file_database = str(db_path) != ":memory:"
     if file_database:
         path = Path(db_path).expanduser()
@@ -353,12 +356,23 @@ def init_db(
             _migrate_legacy_table(conn)
             conn.execute(DELIVERY_SCHEMA)
             _ensure_delivery_columns(conn)
-            for region in regions or []:
+            for region in regions:
                 _ensure_region_table(conn, region)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     except Exception:
+        LOGGER.exception(
+            "Database initialization or migration failed database=%s regions=%s",
+            db_path,
+            list(regions),
+        )
         conn.close()
         raise
+    LOGGER.info(
+        "Database ready database=%s regions=%s schema_version=%s",
+        db_path,
+        list(regions),
+        SCHEMA_VERSION,
+    )
     return conn
 
 
@@ -560,6 +574,12 @@ def retryable_deliveries(
             try:
                 candidate = json.loads(str(row[2]))
             except (TypeError, ValueError):
+                LOGGER.warning(
+                    "Could not decode saved retry payload region=%s listing_id=%s; "
+                    "using fallback notification",
+                    REGIONS[region_id],
+                    row[0],
+                )
                 candidate = None
             if isinstance(candidate, dict):
                 listing = candidate

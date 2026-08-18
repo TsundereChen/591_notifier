@@ -80,7 +80,7 @@ def _http_session():
 
 def _http_get(url, *, timeout):
     current = url
-    for _ in range(4):
+    for redirect_count in range(4):
         parsed = urlparse(current)
         if (
             parsed.scheme != "https"
@@ -90,19 +90,43 @@ def _http_get(url, *, timeout):
             or parsed.port not in (None, 443)
         ):
             raise ValueError(f"request URL must stay on https://{ALLOWED_DETAIL_HOST}")
-        response = _http_session().get(
+        started = time.monotonic()
+        try:
+            response = _http_session().get(
+                current,
+                headers=HEADERS,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        except requests.RequestException:
+            LOGGER.exception(
+                "591 request failed url=%s redirect_count=%s timeout_s=%s",
+                current,
+                redirect_count,
+                timeout,
+            )
+            raise
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        LOGGER.debug(
+            "591 response url=%s status=%s elapsed_ms=%s redirect_count=%s",
             current,
-            headers=HEADERS,
-            timeout=timeout,
-            allow_redirects=False,
+            response.status_code,
+            elapsed_ms,
+            redirect_count,
         )
         if response.is_redirect or response.is_permanent_redirect:
             location = response.headers.get("location")
             if not location:
+                LOGGER.warning(
+                    "591 redirect had no Location header url=%s status=%s",
+                    current,
+                    response.status_code,
+                )
                 return response
             current = urljoin(current, location)
             continue
         return response
+    LOGGER.error("591 request exceeded redirect limit url=%s", url)
     raise requests.TooManyRedirects("too many redirects from 591")
 
 
@@ -794,8 +818,18 @@ def crawl_rent_list(
         params["page"] = int(page)
     url = f"{BASE_URL}?{urlencode(params)}"
 
-    resp = _http_get(url, timeout=timeout)
-    resp.raise_for_status()
+    started = time.monotonic()
+    try:
+        resp = _http_get(url, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException:
+        LOGGER.exception(
+            "591 list request failed region=%s page=%s url=%s",
+            REGIONS[region_id],
+            page,
+            url,
+        )
+        raise
 
     soup = BeautifulSoup(resp.text, "html.parser")
     # The saved fixture uses the legacy id while the current Nuxt page uses
@@ -803,6 +837,14 @@ def crawl_rent_list(
     # being mistaken for a valid empty result.
     container = soup.select_one("#list-container, .list-wrapper")
     if container is None:
+        LOGGER.error(
+            "591 list page had no recognized listing container region=%s page=%s "
+            "url=%s response_chars=%s",
+            REGIONS[region_id],
+            page,
+            url,
+            len(resp.text),
+        )
         raise CrawlerParseError(
             "591 response did not contain the expected listing container"
         )
@@ -819,6 +861,14 @@ def crawl_rent_list(
             parse_errors.append({"id": listing_id, "error": str(exc)})
             LOGGER.warning("Skipping malformed 591 listing %s: %s", listing_id, exc)
     if cards and not listings:
+        LOGGER.error(
+            "591 list page could not parse any cards region=%s page=%s cards=%s "
+            "url=%s",
+            REGIONS[region_id],
+            page,
+            len(cards),
+            url,
+        )
         raise CrawlerParseError(
             f"all {len(cards)} listing cards failed to parse; site markup may have changed"
         )
@@ -826,9 +876,29 @@ def crawl_rent_list(
         page_text = soup.get_text(" ", strip=True)
         empty_markers = ("查無符合", "沒有符合", "暫無符合", "沒有相關物件")
         if not any(marker in page_text for marker in empty_markers):
+            LOGGER.error(
+                "591 list page was empty without an expected empty marker region=%s "
+                "page=%s url=%s response_chars=%s",
+                REGIONS[region_id],
+                page,
+                url,
+                len(resp.text),
+            )
             raise CrawlerParseError(
                 "listing container had no cards and no recognized empty-result message"
             )
+
+    LOGGER.info(
+        "591 list page parsed region=%s page=%s cards=%s listings=%s "
+        "parse_errors=%s elapsed_ms=%s url=%s",
+        REGIONS[region_id],
+        page,
+        len(cards),
+        len(listings),
+        len(parse_errors),
+        round((time.monotonic() - started) * 1000),
+        url,
+    )
 
     return json.dumps(
         {
@@ -1013,6 +1083,7 @@ def crawl_rent_details(urls, timeout=30, delay=0.5):
         try:
             url = _validate_detail_url(url)
         except ValueError as exc:
+            LOGGER.warning("Skipping invalid 591 detail URL url=%r error=%s", url, exc)
             listings.append({"url": str(url), "error": str(exc)})
             continue
         if requested:
@@ -1028,7 +1099,13 @@ def crawl_rent_details(urls, timeout=30, delay=0.5):
             TypeError,
             ValueError,
         ) as exc:
-            LOGGER.warning("Could not crawl 591 detail %s: %s", url, exc)
+            LOGGER.warning(
+                "Could not crawl 591 detail url=%s error_type=%s error=%s",
+                url,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
             listings.append({"url": url, "error": "request failed"})
 
     return json.dumps(

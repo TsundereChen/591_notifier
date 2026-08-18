@@ -99,6 +99,23 @@ def _configure_logging(token=None):
     logging.basicConfig(
         level=os.getenv("LOG_LEVEL", "INFO"), handlers=[handler], force=True
     )
+    http_log_level = os.getenv("HTTP_LOG_LEVEL", "WARNING").upper()
+    try:
+        for logger_name in ("httpx", "httpcore"):
+            logging.getLogger(logger_name).setLevel(http_log_level)
+    except ValueError:
+        for logger_name in ("httpx", "httpcore"):
+            logging.getLogger(logger_name).setLevel(logging.WARNING)
+        LOGGER.warning(
+            "Invalid HTTP_LOG_LEVEL=%r; defaulting third-party HTTP logs to WARNING",
+            http_log_level,
+        )
+        http_log_level = "WARNING"
+    LOGGER.info(
+        "Logging configured application_level=%s third_party_http_level=%s",
+        os.getenv("LOG_LEVEL", "INFO").upper(),
+        http_log_level,
+    )
 
 
 def _store(application):
@@ -469,6 +486,11 @@ def reschedule(application):
         job_kwargs={"trigger": trigger, "coalesce": True, "max_instances": 1},
         name=CRAWL_JOB_NAME,
     )
+    LOGGER.info(
+        "Crawl schedule configured expression=%s timezone=%s",
+        data["schedule"],
+        data["timezone"],
+    )
 
 
 def _listing_message(region, listing):
@@ -533,14 +555,14 @@ async def _listing_images(listing):
         return _usable_image_urls(images) or fallback
     except Exception:
         LOGGER.warning(
-            "Could not load detail-page images for listing %s; using its thumbnail",
+            "Could not load detail-page images; using thumbnail listing_id=%s",
             listing.get("id", "unknown"),
             exc_info=True,
         )
         return fallback
 
 
-async def _send_listing(bot, chat_id, text, images):
+async def _send_listing(bot, chat_id, text, images, *, listing_id="unknown"):
     """Send one listing as a photo, album, or text-only fallback."""
     if len(images) > 1:
         media = [
@@ -550,13 +572,22 @@ async def _send_listing(bot, chat_id, text, images):
         try:
             messages = await bot.send_media_group(chat_id=chat_id, media=media)
             return messages[0]
-        except BadRequest:
-            LOGGER.warning("Telegram rejected listing album; retrying as text")
+        except BadRequest as exc:
+            LOGGER.warning(
+                "Telegram rejected listing album; falling back listing_id=%s error=%s",
+                listing_id,
+                exc,
+            )
     if images:
         try:
             return await bot.send_photo(chat_id=chat_id, photo=images[0], caption=text)
-        except BadRequest:
-            LOGGER.warning("Telegram rejected listing photo; retrying as text")
+        except BadRequest as exc:
+            LOGGER.warning(
+                "Telegram rejected listing photo; falling back to text listing_id=%s "
+                "error=%s",
+                listing_id,
+                exc,
+            )
     return await bot.send_message(
         chat_id=chat_id, text=text, disable_web_page_preview=False
     )
@@ -645,6 +676,7 @@ async def _run_crawler(application, status_chat_id=None):
         LOGGER.warning("略過爬蟲：尚未有 Telegram 對話綁定此機器人")
         return None
     if not data["crawl"]:
+        LOGGER.warning("Skipping crawl because no regions are enabled")
         if status_chat_id:
             await application.bot.send_message(status_chat_id, "尚未啟用任何縣市。")
         return None
@@ -655,27 +687,70 @@ async def _run_crawler(application, status_chat_id=None):
         listing["images"] = images
         for attempt in range(3):
             try:
-                message = await _send_listing(application.bot, chat_id, text, images)
+                message = await _send_listing(
+                    application.bot,
+                    chat_id,
+                    text,
+                    images,
+                    listing_id=listing.get("id", "unknown"),
+                )
                 return {"chat_id": chat_id, "message_id": message.message_id}
             except RetryAfter as exc:
                 if attempt == 2:
+                    LOGGER.error(
+                        "Telegram rate limit exhausted region=%s listing_id=%s "
+                        "attempt=%s retry_after_s=%s",
+                        region,
+                        listing.get("id", "unknown"),
+                        attempt + 1,
+                        exc.retry_after,
+                    )
                     raise
+                LOGGER.warning(
+                    "Telegram rate limit encountered region=%s listing_id=%s "
+                    "attempt=%s retry_after_s=%s",
+                    region,
+                    listing.get("id", "unknown"),
+                    attempt + 1,
+                    exc.retry_after,
+                )
                 await asyncio.sleep(float(exc.retry_after) + 0.25)
 
     try:
+        LOGGER.info(
+            "Starting crawl trigger=%s enabled_regions=%s",
+            "manual" if status_chat_id else "scheduled",
+            len(data["crawl"]),
+        )
         summary = await crawl_and_notify(_store(application).path, notify)
     except Exception:
-        LOGGER.exception("爬蟲執行失敗")
-        error_chat_id = status_chat_id or chat_id
-        await application.bot.send_message(
-            error_chat_id, "爬蟲執行失敗，請查看容器日誌。"
+        LOGGER.exception(
+            "Crawl execution failed trigger=%s",
+            "manual" if status_chat_id else "scheduled",
         )
+        error_chat_id = status_chat_id or chat_id
+        try:
+            await application.bot.send_message(
+                error_chat_id, "爬蟲執行失敗，請查看容器日誌。"
+            )
+        except Exception:
+            LOGGER.exception("Could not send crawl failure report to Telegram")
         return None
     report_chat_id = status_chat_id or chat_id
     if report_chat_id:
-        await application.bot.send_message(
-            report_chat_id, _format_crawl_summary(summary)
-        )
+        try:
+            await application.bot.send_message(
+                report_chat_id, _format_crawl_summary(summary)
+            )
+        except Exception:
+            LOGGER.exception("Could not send crawl completion report to Telegram")
+    LOGGER.info(
+        "Crawl execution succeeded trigger=%s fetched=%s notified=%s failed=%s",
+        "manual" if status_chat_id else "scheduled",
+        summary.get("fetched", "unknown"),
+        summary.get("notified", "unknown"),
+        summary.get("failed", "unknown"),
+    )
     return summary
 
 
@@ -683,11 +758,15 @@ def enqueue_crawl(application, status_chat_id=None):
     """Atomically start one background crawl from the event-loop thread."""
     current = application.bot_data.get("crawl_task")
     if current is not None and not current.done():
+        LOGGER.info("Crawl request ignored because another crawl is active")
         return None
     task = application.create_task(
         _run_crawler(application, status_chat_id), name="591-crawl"
     )
     application.bot_data["crawl_task"] = task
+    LOGGER.info(
+        "Crawl task enqueued trigger=%s", "manual" if status_chat_id else "scheduled"
+    )
 
     def clear(completed):
         if application.bot_data.get("crawl_task") is completed:
@@ -698,6 +777,7 @@ def enqueue_crawl(application, status_chat_id=None):
 
 
 async def scheduled_crawl(context: ContextTypes.DEFAULT_TYPE):
+    LOGGER.info("Scheduled crawl triggered")
     enqueue_crawl(context.application)
 
 
@@ -904,12 +984,23 @@ async def post_init(application: Application):
         ]
     )
     reschedule(application)
+    LOGGER.info("Telegram bot initialized")
 
 
 async def post_shutdown(application: Application):
     instance_lock = application.bot_data.get("instance_lock")
     if instance_lock is not None:
         instance_lock.close()
+    LOGGER.info("Telegram bot shut down")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Log unhandled Telegram handler failures without serializing update data."""
+    LOGGER.error(
+        "Unhandled Telegram handler error update_type=%s",
+        type(update).__name__ if update is not None else "none",
+        exc_info=context.error,
+    )
 
 
 def build_application(token, config_path, template_path=None, allowed_user_id=None):
@@ -944,6 +1035,7 @@ def build_application(token, config_path, template_path=None, allowed_user_id=No
     application.add_handler(CommandHandler("pending", pending_command))
     application.add_handler(CallbackQueryHandler(callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input))
+    application.add_error_handler(error_handler)
     return application
 
 
@@ -954,8 +1046,19 @@ def main():
         raise RuntimeError("必須設定 TELEGRAM_BOT_TOKEN")
     config_path = os.getenv("CONFIG_PATH", "config.yaml")
     template_path = os.getenv("CONFIG_TEMPLATE_PATH")
-    application = build_application(token, config_path, template_path)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application = build_application(token, config_path, template_path)
+    except Exception:
+        LOGGER.exception(
+            "Telegram bot initialization failed config_path=%s", config_path
+        )
+        raise
+    LOGGER.info("Starting Telegram polling config_path=%s", config_path)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception:
+        LOGGER.exception("Telegram bot stopped unexpectedly")
+        raise
 
 
 if __name__ == "__main__":

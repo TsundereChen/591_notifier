@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import re
+import time
+import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -75,13 +77,9 @@ async def crawl_and_notify(
     the next crawl. Full listing data is written only after Telegram accepts the
     notification.
     """
-    config = await _sync_call(run_in_thread, load_config, config_path)
-    conn = await _sync_call(
-        run_in_thread,
-        init_db,
-        config["database"],
-        [job["region_id"] for job in config["jobs"]],
-    )
+    run_id = uuid.uuid4().hex[:12]
+    started = time.monotonic()
+    conn = None
     summary = {
         "fetched": 0,
         "notified": 0,
@@ -114,19 +112,51 @@ async def crawl_and_notify(
             )
         except Exception:
             LOGGER.exception(
-                "Could not record failed delivery %s for listing %s",
-                attempt_count,
+                "Could not record failed delivery run_id=%s region=%s listing_id=%s "
+                "attempt=%s stage=%s",
+                run_id,
+                REGIONS[region_id],
                 listing_id,
+                attempt_count,
+                stage,
             )
             return
         if not updated:
-            LOGGER.info(
-                "Delivery %s for listing %s was already resolved",
-                attempt_count,
+            LOGGER.warning(
+                "Failed delivery state was already resolved run_id=%s region=%s "
+                "listing_id=%s attempt=%s stage=%s",
+                run_id,
+                REGIONS[region_id],
                 listing_id,
+                attempt_count,
+                stage,
+            )
+        else:
+            LOGGER.warning(
+                "Delivery marked ambiguous run_id=%s region=%s listing_id=%s "
+                "attempt=%s stage=%s error=%s",
+                run_id,
+                REGIONS[region_id],
+                listing_id,
+                attempt_count,
+                stage,
+                description,
             )
 
     try:
+        config = await _sync_call(run_in_thread, load_config, config_path)
+        LOGGER.info(
+            "Crawl started run_id=%s regions=%s database=%s",
+            run_id,
+            ",".join(REGIONS[job["region_id"]] for job in config["jobs"]),
+            config["database"],
+        )
+        conn = await _sync_call(
+            run_in_thread,
+            init_db,
+            config["database"],
+            [job["region_id"] for job in config["jobs"]],
+        )
         for job in config["jobs"]:
             region_id = job["region_id"]
             region_name = REGIONS[region_id]
@@ -147,8 +177,22 @@ async def crawl_and_notify(
                 "price_min": job["price_min"],
                 "price_max": job["price_max"],
             }
+            LOGGER.info(
+                "Crawl region started run_id=%s region=%s sections=%s kinds=%s "
+                "price_min=%s price_max=%s",
+                run_id,
+                region_name,
+                job["section_ids"],
+                job["kind_ids"],
+                job["price_min"],
+                job["price_max"],
+            )
             page: list[dict[str, Any]] = []
             seen_page: set[str] = set()
+            duplicate_count = 0
+            invalid_count = 0
+            short_page_count = 0
+            page_parse_errors = 0
             for page_number in range(1, PAGES_PER_REGION + 1):
                 payload = await _sync_call(
                     run_in_thread, crawl_rent_list, **kwargs, page=page_number
@@ -158,27 +202,81 @@ async def crawl_and_notify(
                     data.get("listings"), list
                 ):
                     raise ValueError("crawler returned an invalid payload")
-                summary["parse_failed"] += int(data.get("parse_error_count", 0))
+                source_count = len(data["listings"])
+                parser_errors = int(data.get("parse_error_count", 0))
+                summary["parse_failed"] += parser_errors
+                page_parse_errors += parser_errors
+                if source_count < RESULTS_PER_PAGE:
+                    short_page_count += 1
+                page_duplicates = 0
+                page_invalid = 0
+                accepted_count = 0
 
                 for listing in data["listings"][:RESULTS_PER_PAGE]:
                     if not isinstance(listing, dict) or listing.get("id") is None:
                         summary["parse_failed"] += 1
+                        page_invalid += 1
                         continue
                     listing_id = str(listing["id"])
                     if listing_id in seen_page:
+                        page_duplicates += 1
                         continue
                     seen_page.add(listing_id)
                     page.append(listing)
+                    accepted_count += 1
                     if len(page) == MAX_RESULTS_PER_REGION:
                         break
 
+                duplicate_count += page_duplicates
+                invalid_count += page_invalid
+                LOGGER.info(
+                    "Crawl page collected run_id=%s region=%s page=%s source=%s "
+                    "accepted=%s duplicates=%s invalid=%s parser_skipped=%s "
+                    "ignored_over_page_limit=%s short_page=%s cumulative_unique=%s",
+                    run_id,
+                    region_name,
+                    page_number,
+                    source_count,
+                    accepted_count,
+                    page_duplicates,
+                    page_invalid,
+                    parser_errors,
+                    max(0, source_count - RESULTS_PER_PAGE),
+                    source_count < RESULTS_PER_PAGE,
+                    len(page),
+                )
+
             summary["fetched"] += len(page)
             region_summary["crawled"] = len(page)
+            LOGGER.info(
+                "Crawl region fetch complete run_id=%s region=%s unique_listings=%s "
+                "short_pages=%s cross_page_duplicates=%s invalid_listings=%s "
+                "parser_skipped=%s",
+                run_id,
+                region_name,
+                len(page),
+                short_page_count,
+                duplicate_count,
+                invalid_count,
+                page_parse_errors,
+            )
             page_by_id = {str(listing["id"]): listing for listing in page}
             pending = await _sync_call(
                 run_in_thread, retryable_deliveries, conn, region_id
             )
             pending_ids = {item["listing_id"] for item in pending}
+            if pending:
+                pending_statuses = ",".join(
+                    sorted({item["status"] for item in pending})
+                )
+                LOGGER.warning(
+                    "Retrying incomplete deliveries run_id=%s region=%s count=%s "
+                    "statuses=%s",
+                    run_id,
+                    region_name,
+                    len(pending),
+                    pending_statuses,
+                )
             work_items: list[tuple[dict[str, Any], bool]] = []
             for item in pending:
                 listing_id = item["listing_id"]
@@ -212,6 +310,7 @@ async def crawl_and_notify(
                     region_summary["matched"] += 1
                     continue
 
+                delivery_kind = "retry" if was_pending else "new"
                 attempt_now = _utc_now()
                 reservation = await _sync_call(
                     run_in_thread,
@@ -225,14 +324,37 @@ async def crawl_and_notify(
                 if reservation.status == "sent":
                     summary["skipped"] += 1
                     region_summary["matched"] += 1
+                    LOGGER.info(
+                        "Delivery already recorded run_id=%s region=%s listing_id=%s "
+                        "kind=%s",
+                        run_id,
+                        region_name,
+                        listing_id,
+                        delivery_kind,
+                    )
                     continue
                 if reservation.attempt_count is None:
                     raise RuntimeError("reserved delivery has no attempt count")
+                LOGGER.info(
+                    "Delivery attempt started run_id=%s region=%s listing_id=%s "
+                    "kind=%s attempt=%s",
+                    run_id,
+                    region_name,
+                    listing_id,
+                    delivery_kind,
+                    reservation.attempt_count,
+                )
                 try:
                     receipt = await notify(region_name, listing)
                 except Exception as exc:
                     LOGGER.exception(
-                        "Notification outcome is uncertain for listing %s", listing_id
+                        "Notification outcome is uncertain run_id=%s region=%s "
+                        "listing_id=%s kind=%s attempt=%s",
+                        run_id,
+                        region_name,
+                        listing_id,
+                        delivery_kind,
+                        reservation.attempt_count,
                     )
                     await record_failed_attempt(
                         region_id,
@@ -261,8 +383,13 @@ async def crawl_and_notify(
                     )
                 except Exception as exc:
                     LOGGER.exception(
-                        "Telegram accepted listing %s but SQLite finalization failed",
+                        "Telegram accepted listing but SQLite finalization failed "
+                        "run_id=%s region=%s listing_id=%s kind=%s attempt=%s",
+                        run_id,
+                        region_name,
                         listing_id,
+                        delivery_kind,
+                        reservation.attempt_count,
                     )
                     await record_failed_attempt(
                         region_id,
@@ -277,6 +404,47 @@ async def crawl_and_notify(
                     continue
                 summary["notified"] += 1
                 region_summary["pushed"] += 1
+                LOGGER.info(
+                    "Delivery succeeded run_id=%s region=%s listing_id=%s kind=%s "
+                    "attempt=%s",
+                    run_id,
+                    region_name,
+                    listing_id,
+                    delivery_kind,
+                    reservation.attempt_count,
+                )
+            LOGGER.info(
+                "Crawl region complete run_id=%s region=%s crawled=%s processed=%s "
+                "matched=%s delivered=%s failed=%s retried=%s",
+                run_id,
+                region_name,
+                region_summary["crawled"],
+                region_summary["processed"],
+                region_summary["matched"],
+                region_summary["pushed"],
+                region_summary["failed"],
+                region_summary["retried"],
+            )
+    except Exception:
+        LOGGER.exception(
+            "Crawl failed run_id=%s elapsed_ms=%s",
+            run_id,
+            round((time.monotonic() - started) * 1000),
+        )
+        raise
     finally:
-        await _sync_call(run_in_thread, conn.close)
+        if conn is not None:
+            await _sync_call(run_in_thread, conn.close)
+    LOGGER.info(
+        "Crawl completed run_id=%s elapsed_ms=%s fetched=%s notified=%s "
+        "matched=%s failed=%s retried=%s parser_skipped=%s",
+        run_id,
+        round((time.monotonic() - started) * 1000),
+        summary["fetched"],
+        summary["notified"],
+        summary["skipped"],
+        summary["failed"],
+        summary["retried"],
+        summary["parse_failed"],
+    )
     return summary

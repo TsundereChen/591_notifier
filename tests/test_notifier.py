@@ -1,6 +1,7 @@
 """Tests for notification ordering, deduplication, and county limits."""
 
 import json
+import logging
 import sqlite3
 from unittest import mock
 
@@ -43,6 +44,55 @@ def listing(listing_id):
         "price": "10,000元/月",
         "price_value": 10000,
     }
+
+
+@pytest.mark.asyncio
+async def test_page_logs_explain_short_results_and_cross_page_duplicates(
+    tmp_path, caplog
+):
+    config_path, _ = write_config(tmp_path, "  - region: 新北市\n")
+    responses = [
+        payload("新北市", [listing("one"), listing("two")]),
+        payload("新北市", [listing("two")]),
+        payload("新北市", []),
+        payload("新北市", []),
+        payload("新北市", []),
+    ]
+
+    async def notify(_, __):
+        return None
+
+    caplog.set_level(logging.INFO, logger="rent591_notifier.notifier")
+    with mock.patch("rent591_notifier.notifier.crawl_rent_list", side_effect=responses):
+        await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    messages = "\n".join(caplog.messages)
+    assert "page=1 source=2 accepted=2 duplicates=0" in messages
+    assert "page=2 source=1 accepted=0 duplicates=1" in messages
+    assert (
+        "unique_listings=2 short_pages=5 cross_page_duplicates=1 "
+        "invalid_listings=0 parser_skipped=0"
+    ) in messages
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_logs_retry_context(tmp_path, caplog):
+    config_path, _ = write_config(tmp_path, "  - region: 新北市\n")
+
+    async def notify(_, __):
+        raise RuntimeError("Telegram unavailable")
+
+    caplog.set_level(logging.WARNING, logger="rent591_notifier.notifier")
+    with mock.patch(
+        "rent591_notifier.notifier.crawl_rent_list",
+        return_value=payload("新北市", [listing("failed")]),
+    ):
+        await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    messages = "\n".join(caplog.messages)
+    assert "Notification outcome is uncertain" in messages
+    assert "region=新北市 listing_id=failed kind=new attempt=1" in messages
+    assert "Delivery marked ambiguous" in messages
 
 
 @pytest.mark.asyncio

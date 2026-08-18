@@ -1064,6 +1064,16 @@ def test_main_requires_token(monkeypatch):
     configure_logging.assert_called_once_with(None)
 
 
+def test_configure_logging_quiets_third_party_http_success_logs(monkeypatch):
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
+    monkeypatch.delenv("HTTP_LOG_LEVEL", raising=False)
+
+    bot._configure_logging()
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+
+
 def test_redacting_formatter_hides_token_in_message_and_traceback():
     token = "1234567890:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     formatter = bot._RedactingFormatter(
