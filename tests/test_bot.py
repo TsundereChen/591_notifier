@@ -218,13 +218,14 @@ def test_listing_message_includes_ai_verdict():
 
 
 def test_ai_view_shows_status_and_controls(monkeypatch):
-    monkeypatch.setattr(bot, "api_key_from_env", lambda: "configured")
+    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: "configured")
 
     text, keyboard = _ai_view(
         {
             "ai": {
                 "enabled": True,
                 "filter": False,
+                "provider": "go",
                 "model": "kimi-k3",
                 "criteria": "重視採光",
             }
@@ -233,6 +234,7 @@ def test_ai_view_shows_status_and_controls(monkeypatch):
 
     assert "狀態：啟用" in text
     assert "僅在通知中標註評語" in text
+    assert "提供者：OpenCode Go" in text
     assert "API 金鑰：已設定" in text
     assert "評估標準：重視採光" in text
     assert {
@@ -637,6 +639,14 @@ async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
     await callback(harness.update, harness.context)
     assert harness.store.load()["ai"]["filter"] is False
 
+    harness.query.data = "ai_provider"
+    await callback(harness.update, harness.context)
+    assert harness.store.load()["ai"]["provider"] == "zen"
+
+    harness.query.data = "ai_provider"
+    await callback(harness.update, harness.context)
+    assert harness.store.load()["ai"]["provider"] == "go"
+
     harness.query.data = "ai_criteria"
     await callback(harness.update, harness.context)
     assert harness.context.user_data["awaiting"] == ("ai_criteria", None)
@@ -650,6 +660,19 @@ async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
     harness.message.text = "mimo-v2-omni"
     await bot.text_input(harness.update, harness.context)
     assert harness.store.load()["ai"]["model"] == "mimo-v2-omni"
+
+    harness.query.data = "ai_api_key"
+    await callback(harness.update, harness.context)
+    assert harness.context.user_data["awaiting"] == ("ai_api_key", None)
+    harness.message.text = "test-zen-key"
+    await bot.text_input(harness.update, harness.context)
+    assert harness.store.load()["ai"]["api_key"] == "test-zen-key"
+
+    harness.query.data = "ai_api_key"
+    await callback(harness.update, harness.context)
+    harness.message.text = "-"
+    await bot.text_input(harness.update, harness.context)
+    assert harness.store.load()["ai"]["api_key"] is None
 
 
 @pytest.mark.asyncio
@@ -1065,7 +1088,7 @@ async def test_run_crawler_wires_ai_evaluation_and_filtering(bot_harness, monkey
         assert listing["images"] == ["https://img.591.com.tw/one.jpg"]
         return {"regions": []}
 
-    monkeypatch.setattr(bot, "api_key_from_env", lambda: "test-key")
+    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: "test-key")
     monkeypatch.setattr(bot, "evaluate_listing", judge)
     monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
 

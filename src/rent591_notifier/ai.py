@@ -1,8 +1,8 @@
-"""Evaluate 591 listings with an OpenCode Go chat model, including photos.
+"""Evaluate 591 listings with an OpenCode chat model, including photos.
 
 The evaluator fetches the listing detail page, flattens every structured
 field into a prompt, downloads the album images itself, and asks an
-OpenAI-compatible chat model (OpenCode Go) for a JSON verdict of the form
+OpenAI-compatible chat model (OpenCode Go or Zen) for a JSON verdict of the form
 {"good": bool, "score": 0-10, "reason": str}.
 """
 
@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import requests
@@ -22,8 +22,20 @@ from .crawler import HEADERS, crawl_rent_details
 
 LOGGER = logging.getLogger(__name__)
 
-API_KEY_ENV = "OPENCODE_GO_API_KEY"
-BASE_URL = "https://opencode.ai/zen/go/v1"
+# Provider constants
+PROVIDER_GO = "go"
+PROVIDER_ZEN = "zen"
+PROVIDER_CHOICES = (PROVIDER_GO, PROVIDER_ZEN)
+
+GO_API_KEY_ENV = "OPENCODE_GO_API_KEY"
+ZEN_API_KEY_ENV = "OPENCODE_ZEN_API_KEY"
+# Backwards compatibility
+API_KEY_ENV = GO_API_KEY_ENV
+
+GO_BASE_URL = "https://opencode.ai/zen/go/v1"
+ZEN_BASE_URL = "https://opencode.ai/zen/v1"
+
+DEFAULT_PROVIDER = PROVIDER_GO
 DEFAULT_MODEL = "kimi-k3"
 DEFAULT_MAX_IMAGES = 6
 MAX_IMAGES_LIMIT = 10
@@ -56,10 +68,16 @@ class _BadRequestError(AIEvaluationError):
     """An HTTP 400 from the provider; the request may work with fewer options."""
 
 
-def api_key_from_env() -> str | None:
-    """Return the configured OpenCode Go API key, if any."""
-    value = os.getenv(API_KEY_ENV)
+def api_key_from_env(provider: Literal["go", "zen"] = PROVIDER_GO) -> str | None:
+    """Return the configured OpenCode API key for the given provider, if any."""
+    env_var = GO_API_KEY_ENV if provider == PROVIDER_GO else ZEN_API_KEY_ENV
+    value = os.getenv(env_var)
     return value.strip() if value and value.strip() else None
+
+
+def base_url_for_provider(provider: Literal["go", "zen"] = PROVIDER_GO) -> str:
+    """Return the base URL for the given provider."""
+    return GO_BASE_URL if provider == PROVIDER_GO else ZEN_BASE_URL
 
 
 def _section_lines(title: str, pairs: dict[str, Any]) -> list[str]:
@@ -182,7 +200,12 @@ def _download_image(url: str, timeout: int = 30) -> str | None:
 
 
 def _chat_completion(
-    api_key: str, model: str, messages: list[dict[str, Any]], *, json_mode: bool
+    api_key: str | None,
+    base_url: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    json_mode: bool,
 ) -> str:
     payload: dict[str, Any] = {
         "model": model,
@@ -191,10 +214,13 @@ def _chat_completion(
     }
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     try:
         resp = requests.post(
-            f"{BASE_URL}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}"},
+            f"{base_url}/chat/completions",
+            headers=headers,
             json=payload,
             timeout=REQUEST_TIMEOUT,
         )
@@ -259,9 +285,24 @@ def evaluate_listing(
     returned image URLs are the detail-page album so callers can reuse them
     for the Telegram notification without crawling the page twice.
     """
-    api_key = api_key if api_key is not None else api_key_from_env()
+    provider = str(ai_config.get("provider") or DEFAULT_PROVIDER)
+    if provider not in PROVIDER_CHOICES:
+        provider = DEFAULT_PROVIDER
+
+    # API key: from config (ai.api_key), then env, then None (for Zen free models)
+    config_api_key = ai_config.get("api_key")
+    api_key = api_key if api_key is not None else config_api_key
     if not api_key:
-        raise AIEvaluationError(f"{API_KEY_ENV} is not set")
+        api_key = api_key_from_env(provider)
+
+    # For Zen, allow empty API key (free models)
+    if provider == PROVIDER_ZEN and not api_key:
+        api_key = None
+
+    # For Go, API key is required
+    if provider == PROVIDER_GO and not api_key:
+        raise AIEvaluationError(f"{GO_API_KEY_ENV} is not set")
+
     url = listing.get("url")
     if not url:
         raise AIEvaluationError("listing has no detail URL")
@@ -301,6 +342,7 @@ def evaluate_listing(
     if not image_parts:
         attempts = [(True, False), (False, False)]
     last_error: AIEvaluationError | None = None
+    base_url = base_url_for_provider(provider)
     for json_mode, with_images in attempts:
         user_content: list[dict[str, Any]] = [{"type": "text", "text": text}]
         if with_images:
@@ -310,7 +352,9 @@ def evaluate_listing(
             {"role": "user", "content": user_content},
         ]
         try:
-            content = _chat_completion(api_key, model, messages, json_mode=json_mode)
+            content = _chat_completion(
+                api_key, base_url, model, messages, json_mode=json_mode
+            )
         except _BadRequestError as exc:
             last_error = exc
             LOGGER.warning(
@@ -323,11 +367,12 @@ def evaluate_listing(
             continue
         verdict = _parse_verdict(content)
         LOGGER.info(
-            "AI evaluation completed listing_id=%s good=%s score=%s images=%s",
+            "AI evaluation completed listing_id=%s good=%s score=%s images=%s provider=%s",
             listing.get("id", "unknown"),
             verdict["good"],
             verdict["score"],
             len(image_parts) if with_images else 0,
+            provider,
         )
         return verdict, image_urls
     raise AIEvaluationError(

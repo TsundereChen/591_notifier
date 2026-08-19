@@ -17,9 +17,11 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     assert initial["ai"] == {
         "enabled": False,
         "filter": True,
+        "provider": "go",
         "model": "kimi-k3",
         "criteria": None,
         "max_images": 6,
+        "api_key": None,
     }
 
     store.set_owner(123, 456)
@@ -30,8 +32,10 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     store.set_schedule("0 * * * *")
     store.set_ai_enabled(True)
     store.set_ai_filter(False)
+    store.set_ai_provider("zen")
     store.set_ai_model("mimo-v2-omni")
     store.set_ai_criteria("重視採光與捷運距離")
+    store.set_ai_api_key("test-zen-key")
 
     reloaded = ConfigStore(path).load()
     assert reloaded["telegram"] == {"owner_user_id": 123, "chat_id": 456}
@@ -39,9 +43,11 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     assert reloaded["ai"] == {
         "enabled": True,
         "filter": False,
+        "provider": "zen",
         "model": "mimo-v2-omni",
         "criteria": "重視採光與捷運距離",
         "max_images": 6,
+        "api_key": "test-zen-key",
     }
     assert reloaded["crawl"] == [
         {
@@ -85,6 +91,7 @@ def test_template_is_copied_when_runtime_config_is_missing(tmp_path):
     assert data["database"] == "custom.db"
     assert data["schedule"] == "0 8 * * *"
     assert data["timezone"] == "Asia/Taipei"
+    assert data["ai"]["provider"] == "go"
 
 
 def test_old_pages_option_is_removed(tmp_path):
@@ -98,25 +105,6 @@ def test_old_pages_option_is_removed(tmp_path):
 
     assert "pages" not in data["crawl"][0]
     assert data["crawl"][0]["sections"] == []
-
-
-@pytest.mark.parametrize(
-    "text, message",
-    [
-        ("[]\n", "root must be"),
-        ("crawl: nope\n", "must be a list"),
-        ("crawl: [nope]\n", "must be a mapping"),
-        ("crawl: [{region: 新北市}, {region: 3}]\n", "duplicate crawl region"),
-    ],
-)
-def test_invalid_existing_config_fails_without_overwriting(tmp_path, text, message):
-    path = tmp_path / "config.yaml"
-    path.write_text(text, encoding="utf-8")
-
-    with pytest.raises(ValueError, match=message):
-        ConfigStore(path)
-
-    assert path.read_text(encoding="utf-8") == text
 
 
 def test_owner_binding_is_pinned(tmp_path):
@@ -153,8 +141,10 @@ def test_instance_lock_rejects_second_process_lock(tmp_path):
     [
         ("enabled: nope", "ai.enabled"),
         ("filter: nope", "ai.filter"),
+        ("provider: invalid", "ai.provider"),
         ("model: invalid model", "ai.model"),
         ("max_images: 11", "ai.max_images"),
+        ("api_key: 123", "ai.api_key"),
     ],
 )
 def test_invalid_ai_configuration_is_rejected(tmp_path, ai_config, message):

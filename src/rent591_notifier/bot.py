@@ -28,7 +28,16 @@ from telegram.ext import (
     filters,
 )
 
-from .ai import API_KEY_ENV, DEFAULT_MODEL, api_key_from_env, evaluate_listing
+from .ai import (
+    API_KEY_ENV,
+    DEFAULT_MODEL,
+    GO_API_KEY_ENV,
+    PROVIDER_CHOICES,
+    PROVIDER_GO,
+    PROVIDER_ZEN,
+    api_key_from_env,
+    evaluate_listing,
+)
 from .config_store import ConfigStore
 from .crawler import (
     KINDS,
@@ -325,13 +334,28 @@ def _ai_view(data):
     ai = data.get("ai") or {}
     enabled = bool(ai.get("enabled"))
     filter_mode = bool(ai.get("filter", True))
+    provider = ai.get("provider") or PROVIDER_GO
     model = ai.get("model") or DEFAULT_MODEL
     criteria = (ai.get("criteria") or "").strip() or "（使用預設標準）"
-    key_status = "已設定" if api_key_from_env() else f"未設定（環境變數 {API_KEY_ENV}）"
+    provider_label = "OpenCode Go" if provider == PROVIDER_GO else "OpenCode Zen"
+    # Determine which API key to check based on provider
+    if provider == PROVIDER_GO:
+        key_status = (
+            "已設定"
+            if api_key_from_env(PROVIDER_GO)
+            else "未設定（環境變數 OPENCODE_GO_API_KEY）"
+        )
+    else:
+        key_status = (
+            "已設定"
+            if api_key_from_env(PROVIDER_ZEN)
+            else "未設定（環境變數 OPENCODE_ZEN_API_KEY，免費模型可選）"
+        )
     text = (
         "AI 物件評估\n\n"
         f"狀態：{'啟用' if enabled else '停用'}\n"
         f"模式：{'過濾不推薦的物件' if filter_mode else '僅在通知中標註評語'}\n"
+        f"提供者：{provider_label}\n"
         f"模型：{model}\n"
         f"API 金鑰：{key_status}\n"
         f"評估標準：{criteria}"
@@ -344,8 +368,14 @@ def _ai_view(data):
             )
         ],
         [InlineKeyboardButton("切換模式（過濾／標註）", callback_data="ai_mode")],
+        [
+            InlineKeyboardButton(
+                f"提供者：{provider_label}", callback_data="ai_provider"
+            )
+        ],
         [InlineKeyboardButton("✏️ 評估標準", callback_data="ai_criteria")],
         [InlineKeyboardButton("✏️ 模型", callback_data="ai_model")],
+        [InlineKeyboardButton("✏️ API 金鑰", callback_data="ai_api_key")],
         [InlineKeyboardButton("⬅️ 主選單", callback_data="home")],
     ]
     return text, InlineKeyboardMarkup(buttons)
@@ -476,7 +506,11 @@ def _config_summary(data):
     ai = data.get("ai") or {}
     if ai.get("enabled"):
         mode = "過濾模式" if ai.get("filter", True) else "標註模式"
-        ai_text = f"啟用（{mode}，{ai.get('model') or DEFAULT_MODEL}）"
+        provider = ai.get("provider") or PROVIDER_GO
+        provider_label = "Go" if provider == PROVIDER_GO else "Zen"
+        ai_text = (
+            f"啟用（{mode}，{provider_label}，{ai.get('model') or DEFAULT_MODEL}）"
+        )
     else:
         ai_text = "停用"
     lines = [
@@ -737,13 +771,19 @@ async def _run_crawler(application, status_chat_id=None):
     evaluate = None
     ai_config = data.get("ai") or {}
     if ai_config.get("enabled"):
-        api_key = api_key_from_env()
-        if not api_key:
+        provider = ai_config.get("provider") or PROVIDER_GO
+        api_key = api_key_from_env(provider)
+        # For Zen, allow empty API key (free models)
+        if provider == PROVIDER_ZEN and not api_key:
+            api_key = None
+        # For Go, API key is required
+        if provider == PROVIDER_GO and not api_key:
             LOGGER.warning(
                 "AI evaluation is enabled but %s is not set; continuing without AI",
-                API_KEY_ENV,
+                GO_API_KEY_ENV,
             )
-        else:
+            api_key = None
+        if api_key is not None or provider == PROVIDER_ZEN:
             filter_rejected = ai_config.get("filter", True)
 
             async def evaluate(region, listing):
@@ -985,7 +1025,18 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     elif action == "ai_model":
         context.user_data["awaiting"] = ("ai_model", None)
-        await query.message.reply_text("請輸入 OpenCode Go 模型 ID，例如：kimi-k3")
+        await query.message.reply_text("請輸入模型 ID，例如：kimi-k3")
+        return
+    elif action == "ai_provider":
+        current = store.load()["ai"].get("provider", PROVIDER_GO)
+        next_provider = PROVIDER_ZEN if current == PROVIDER_GO else PROVIDER_GO
+        store.set_ai_provider(next_provider)
+        view = _ai_view(store.load())
+    elif action == "ai_api_key":
+        context.user_data["awaiting"] = ("ai_api_key", None)
+        await query.message.reply_text(
+            "請輸入 API 金鑰，或輸入 - 清除（OpenCode Zen 免費模型可留空）。"
+        )
         return
     elif action == "schedule":
         view = _schedule_view(store.load())
@@ -1078,6 +1129,18 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.effective_message.reply_text(
             "AI 模型已更新。請使用 /menu 繼續設定。"
+        )
+        return
+
+    if kind == "ai_api_key":
+        try:
+            store.set_ai_api_key(None if value == "-" else value)
+        except ValueError:
+            context.user_data["awaiting"] = awaiting
+            await update.effective_message.reply_text("API 金鑰格式無效。")
+            return
+        await update.effective_message.reply_text(
+            "AI API 金鑰已更新。請使用 /menu 繼續設定。"
         )
         return
 

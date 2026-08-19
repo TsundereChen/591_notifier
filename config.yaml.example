@@ -17,13 +17,17 @@ telegram:
   chat_id:
 
 # AI 物件評估（預設停用）。啟用後，會先讀取物件詳情與照片，再使用
-# OpenCode Go 模型給出推薦與理由。另需設定環境變數 OPENCODE_GO_API_KEY。
+# OpenCode Go 或 Zen 模型給出推薦與理由。
+# - provider: go（預設，需 OPENCODE_GO_API_KEY）或 zen（可用免費模型，OPENCODE_ZEN_API_KEY 選填）
+# - api_key: 選填，可寫在 YAML 或用環境變數；Zen 免費模型可留空
 ai:
   enabled: false
   filter: true # true：不通知 AI 不推薦的物件；false：仍通知，但附上 AI 評語。
+  provider: go # go 或 zen
   model: kimi-k3
   criteria: # 可填寫自訂偏好；留空時使用預設的租金、屋況、採光與紅旗評估。
   max_images: 6
+  api_key: # 選填，環境變數優先：OPENCODE_GO_API_KEY 或 OPENCODE_ZEN_API_KEY
 
 crawl:
   - region: 新北市

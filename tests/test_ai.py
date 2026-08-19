@@ -1,4 +1,4 @@
-"""Tests for OpenCode Go listing evaluation."""
+"""Tests for OpenCode Go and Zen listing evaluation."""
 
 import json
 from types import SimpleNamespace
@@ -59,7 +59,7 @@ def chat_response(content):
     )
 
 
-def test_evaluate_listing_sends_full_detail_and_images(monkeypatch):
+def test_evaluate_listing_sends_full_detail_and_images_go(monkeypatch):
     post = MagicMock(
         return_value=chat_response('{"good": true, "score": 8, "reason": "採光佳"}')
     )
@@ -69,7 +69,7 @@ def test_evaluate_listing_sends_full_detail_and_images(monkeypatch):
     )
 
     verdict, images = ai.evaluate_listing(
-        {"model": "kimi-k3", "criteria": "重視採光", "max_images": 6},
+        {"provider": "go", "model": "kimi-k3", "criteria": "重視採光", "max_images": 6},
         "新北市",
         listing(),
         api_key="test-key",
@@ -82,6 +82,8 @@ def test_evaluate_listing_sends_full_detail_and_images(monkeypatch):
     assert request["model"] == "kimi-k3"
     assert request["response_format"] == {"type": "json_object"}
     assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer test-key"}
+    # Verify Go base URL was used
+    assert post.call_args.args[0] == "https://opencode.ai/zen/go/v1/chat/completions"
     user_content = request["messages"][1]["content"]
     prompt = user_content[0]["text"]
     assert "完整地址：新北市土城區中央路100號" in prompt
@@ -89,6 +91,68 @@ def test_evaluate_listing_sends_full_detail_and_images(monkeypatch):
     assert "提供設備：冷氣、洗衣機" in prompt
     assert "屋況描述：客廳採光佳" in prompt
     assert user_content[1]["type"] == "image_url"
+
+
+def test_evaluate_listing_uses_zen_provider(monkeypatch):
+    post = MagicMock(
+        return_value=chat_response('{"good": true, "score": 7, "reason": "CP值高"}')
+    )
+    monkeypatch.setattr(ai.requests, "post", post)
+    monkeypatch.setattr(
+        ai, "_download_image", lambda _: "data:image/jpeg;base64,aW1hZ2U="
+    )
+
+    verdict, _ = ai.evaluate_listing(
+        {
+            "provider": "zen",
+            "model": "mimo-v2.5-free",
+            "criteria": "預算優先",
+            "max_images": 4,
+        },
+        "台北市",
+        listing(),
+        api_key="zen-key",
+        detail_fetcher=lambda *_args, **_kwargs: detail_payload(),
+    )
+
+    assert verdict == {"good": True, "score": 7, "reason": "CP值高"}
+    # Verify Zen base URL was used
+    assert post.call_args.args[0] == "https://opencode.ai/zen/v1/chat/completions"
+    assert post.call_args.kwargs["json"]["model"] == "mimo-v2.5-free"
+    assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer zen-key"}
+
+
+def test_evaluate_listing_zen_without_api_key(monkeypatch):
+    """Zen provider should work without API key for free models."""
+    post = MagicMock(
+        return_value=chat_response('{"good": false, "score": 2, "reason": "租金偏高"}')
+    )
+    monkeypatch.setattr(ai.requests, "post", post)
+    monkeypatch.setattr(ai, "_download_image", lambda _: None)
+
+    verdict, _ = ai.evaluate_listing(
+        {"provider": "zen", "model": "mimo-v2.5-free", "criteria": "預算優先"},
+        "新北市",
+        listing(),
+        api_key=None,  # No API key for free models
+        detail_fetcher=lambda *_args, **_kwargs: detail_payload(),
+    )
+
+    assert verdict["good"] is False
+    # No Authorization header when api_key is None
+    assert "Authorization" not in post.call_args.kwargs.get("headers", {})
+
+
+def test_evaluate_listing_go_requires_api_key():
+    """Go provider should fail when no API key is provided."""
+    with pytest.raises(ai.AIEvaluationError, match="OPENCODE_GO_API_KEY is not set"):
+        ai.evaluate_listing(
+            {"provider": "go", "model": "kimi-k3"},
+            "新北市",
+            listing(),
+            api_key=None,
+            detail_fetcher=lambda *_args, **_kwargs: detail_payload(),
+        )
 
 
 def test_evaluate_listing_retries_without_json_mode_after_bad_request(monkeypatch):

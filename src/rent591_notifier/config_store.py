@@ -21,6 +21,9 @@ from .ai import (
     DEFAULT_MODEL,
     MAX_CRITERIA_CHARS,
     MAX_IMAGES_LIMIT,
+    PROVIDER_CHOICES,
+    PROVIDER_GO,
+    PROVIDER_ZEN,
 )
 from .crawler import (
     KINDS,
@@ -42,9 +45,11 @@ DEFAULT_CONFIG = {
     "ai": {
         "enabled": False,
         "filter": True,
+        "provider": PROVIDER_GO,
         "model": DEFAULT_MODEL,
         "criteria": None,
         "max_images": DEFAULT_MAX_IMAGES,
+        "api_key": None,
     },
     "crawl": [],
 }
@@ -168,21 +173,28 @@ class ConfigStore:
         unknown_ai_keys = set(ai) - {
             "enabled",
             "filter",
+            "provider",
             "model",
             "criteria",
             "max_images",
+            "api_key",
         }
         if unknown_ai_keys:
             raise ValueError(f"'ai' has unknown keys: {sorted(unknown_ai_keys)}")
         ai.setdefault("enabled", False)
         ai.setdefault("filter", True)
+        ai.setdefault("provider", PROVIDER_GO)
         ai.setdefault("model", DEFAULT_MODEL)
         ai.setdefault("criteria", None)
         ai.setdefault("max_images", DEFAULT_MAX_IMAGES)
+        ai.setdefault("api_key", None)
         if not isinstance(ai["enabled"], bool):
             raise ValueError("'ai.enabled' must be a boolean")
         if not isinstance(ai["filter"], bool):
             raise ValueError("'ai.filter' must be a boolean")
+        provider = ai.get("provider")
+        if provider not in PROVIDER_CHOICES:
+            raise ValueError(f"'ai.provider' must be one of {PROVIDER_CHOICES}")
         if not isinstance(ai["model"], str) or not MODEL_ID_PATTERN.fullmatch(
             ai["model"]
         ):
@@ -203,6 +215,10 @@ class ConfigStore:
             raise ValueError(
                 f"'ai.max_images' must be an integer between 1 and {MAX_IMAGES_LIMIT}"
             )
+        if ai["api_key"] is not None and (
+            not isinstance(ai["api_key"], str) or not ai["api_key"].strip()
+        ):
+            raise ValueError("'ai.api_key' must be a non-empty string or null")
 
         crawl = result.get("crawl")
         if not isinstance(crawl, list):
@@ -452,5 +468,21 @@ class ConfigStore:
         return self.update(
             lambda data: data["ai"].__setitem__(
                 "criteria", criteria.strip() if criteria else None
+            )
+        )
+
+    def set_ai_provider(self, provider: str):
+        if provider not in PROVIDER_CHOICES:
+            raise ValueError(f"provider must be one of {PROVIDER_CHOICES}")
+        return self.update(lambda data: data["ai"].__setitem__("provider", provider))
+
+    def set_ai_api_key(self, api_key: str | None):
+        if api_key is not None and (
+            not isinstance(api_key, str) or not api_key.strip()
+        ):
+            raise ValueError("api_key must be a non-empty string or None")
+        return self.update(
+            lambda data: data["ai"].__setitem__(
+                "api_key", api_key.strip() if api_key else None
             )
         )
