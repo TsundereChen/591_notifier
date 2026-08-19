@@ -918,6 +918,14 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(text, reply_markup=keyboard)
 
 
+async def ai_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await _authorized(update, context.application):
+        await _reject(update)
+        return
+    text, keyboard = _ai_view(_store(context.application).load())
+    await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+
 async def crawl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _authorized(update, context.application):
         await _reject(update)
@@ -1168,6 +1176,7 @@ async def post_init(application: Application):
         [
             BotCommand("start", "綁定並開啟機器人"),
             BotCommand("menu", "開啟設定選單"),
+            BotCommand("ai", "設定 AI 物件評估"),
             BotCommand("crawl", "立即執行爬蟲"),
             BotCommand("pending", "處理結果不明通知"),
         ]
@@ -1220,6 +1229,7 @@ def build_application(token, config_path, template_path=None, allowed_user_id=No
     application.bot_data["crawl_task"] = None
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu))
+    application.add_handler(CommandHandler("ai", ai_menu))
     application.add_handler(CommandHandler("crawl", crawl_command))
     application.add_handler(CommandHandler("pending", pending_command))
     application.add_handler(CallbackQueryHandler(callback))

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from telegram.ext import CommandHandler
 
 from rent591_notifier import bot
 from rent591_notifier.bot import (
@@ -819,6 +820,7 @@ async def test_existing_owner_can_complete_missing_private_chat_binding(tmp_path
     [
         ("start", True),
         ("menu", False),
+        ("ai_menu", False),
         ("crawl_command", False),
         ("pending_command", False),
     ],
@@ -853,12 +855,14 @@ async def test_command_handlers_reply_for_authorized_user(bot_harness, monkeypat
 
     await bot.start(bot_harness.update, bot_harness.context)
     await bot.menu(bot_harness.update, bot_harness.context)
+    await bot.ai_menu(bot_harness.update, bot_harness.context)
     await bot.crawl_command(bot_harness.update, bot_harness.context)
     await bot.crawl_command(bot_harness.update, bot_harness.context)
     await bot.pending_command(bot_harness.update, bot_harness.context)
 
     replies = [call.args[0] for call in bot_harness.message.reply_text.await_args_list]
     assert any("591 租屋通知機器人" in reply for reply in replies)
+    assert any("AI 物件評估" in reply for reply in replies)
     assert "正在背景執行爬蟲……" in replies
     assert "爬蟲正在執行中，請稍候。" in replies
     assert "pending" in replies
@@ -1144,6 +1148,7 @@ async def test_post_init_and_shutdown_manage_bot_lifecycle(bot_harness, monkeypa
     assert [command.command for command in commands] == [
         "start",
         "menu",
+        "ai",
         "crawl",
         "pending",
     ]
@@ -1164,7 +1169,14 @@ def test_build_application_registers_handlers_and_releases_lock(tmp_path):
     try:
         assert application.bot_data["allowed_user_id"] == 123
         assert application.bot_data["crawl_task"] is None
-        assert len(application.handlers[0]) == 6
+        assert len(application.handlers[0]) == 7
+        ai_handler = next(
+            handler
+            for handler in application.handlers[0]
+            if isinstance(handler, CommandHandler)
+            and handler.commands == frozenset({"ai"})
+        )
+        assert ai_handler.callback is bot.ai_menu
     finally:
         application.bot_data["instance_lock"].close()
 
