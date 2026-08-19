@@ -654,6 +654,7 @@ async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
     harness.message.text = "重視採光"
     await bot.text_input(harness.update, harness.context)
     assert harness.store.load()["ai"]["criteria"] == "重視採光"
+    assert "/ai" in harness.message.reply_text.await_args.args[0]
 
     harness.query.data = "ai_model"
     await callback(harness.update, harness.context)
@@ -661,6 +662,7 @@ async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
     harness.message.text = "mimo-v2-omni"
     await bot.text_input(harness.update, harness.context)
     assert harness.store.load()["ai"]["model"] == "mimo-v2-omni"
+    assert "/ai" in harness.message.reply_text.await_args.args[0]
 
     harness.query.data = "ai_api_key"
     await callback(harness.update, harness.context)
@@ -668,6 +670,7 @@ async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
     harness.message.text = "test-zen-key"
     await bot.text_input(harness.update, harness.context)
     assert harness.store.load()["ai"]["api_key"] == "test-zen-key"
+    assert "/ai" in harness.message.reply_text.await_args.args[0]
 
     harness.query.data = "ai_api_key"
     await callback(harness.update, harness.context)

@@ -1124,7 +1124,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await update.effective_message.reply_text(
-            "AI 評估標準已更新。請使用 /menu 繼續設定。"
+            "AI 評估標準已更新。請使用 /ai 繼續設定。"
         )
         return
 
@@ -1136,7 +1136,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("模型 ID 無效，例如：kimi-k3")
             return
         await update.effective_message.reply_text(
-            "AI 模型已更新。請使用 /menu 繼續設定。"
+            "AI 模型已更新。請使用 /ai 繼續設定。"
         )
         return
 
@@ -1148,7 +1148,7 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("API 金鑰格式無效。")
             return
         await update.effective_message.reply_text(
-            "AI API 金鑰已更新。請使用 /menu 繼續設定。"
+            "AI API 金鑰已更新。請使用 /ai 繼續設定。"
         )
         return
 
