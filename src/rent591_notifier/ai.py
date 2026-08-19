@@ -201,9 +201,7 @@ def _chat_completion(
     except requests.RequestException as exc:
         raise AIEvaluationError(f"AI request failed: {exc}") from exc
     if resp.status_code == 400:
-        raise _BadRequestError(
-            f"AI provider rejected the request: {resp.text[:200]}"
-        )
+        raise _BadRequestError(f"AI provider rejected the request: {resp.text[:200]}")
     if resp.status_code != 200:
         raise AIEvaluationError(
             f"AI provider returned HTTP {resp.status_code}: {resp.text[:200]}"
@@ -290,9 +288,7 @@ def evaluate_listing(
     for image_url in image_urls[:max_images]:
         data_url = _download_image(image_url)
         if data_url:
-            image_parts.append(
-                {"type": "image_url", "image_url": {"url": data_url}}
-            )
+            image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
 
     text = (
         f"評估標準：\n{criteria}\n\n"
@@ -334,4 +330,6 @@ def evaluate_listing(
             len(image_parts) if with_images else 0,
         )
         return verdict, image_urls
-    raise AIEvaluationError("AI provider rejected every request variant") from last_error
+    raise AIEvaluationError(
+        "AI provider rejected every request variant"
+    ) from last_error

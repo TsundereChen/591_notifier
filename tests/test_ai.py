@@ -60,7 +60,9 @@ def chat_response(content):
 
 
 def test_evaluate_listing_sends_full_detail_and_images(monkeypatch):
-    post = MagicMock(return_value=chat_response('{"good": true, "score": 8, "reason": "採光佳"}'))
+    post = MagicMock(
+        return_value=chat_response('{"good": true, "score": 8, "reason": "採光佳"}')
+    )
     monkeypatch.setattr(ai.requests, "post", post)
     monkeypatch.setattr(
         ai, "_download_image", lambda _: "data:image/jpeg;base64,aW1hZ2U="
@@ -98,7 +100,9 @@ def test_evaluate_listing_retries_without_json_mode_after_bad_request(monkeypatc
         ]
     )
     monkeypatch.setattr(ai.requests, "post", post)
-    monkeypatch.setattr(ai, "_download_image", lambda _: "data:image/jpeg;base64,aW1hZ2U=")
+    monkeypatch.setattr(
+        ai, "_download_image", lambda _: "data:image/jpeg;base64,aW1hZ2U="
+    )
 
     verdict, _ = ai.evaluate_listing(
         {},
