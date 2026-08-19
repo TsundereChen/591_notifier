@@ -28,6 +28,7 @@ from telegram.ext import (
     filters,
 )
 
+from .ai import API_KEY_ENV, DEFAULT_MODEL, api_key_from_env, evaluate_listing
 from .config_store import ConfigStore
 from .crawler import (
     KINDS,
@@ -197,6 +198,7 @@ def _home_view(data):
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🏙 縣市與篩選條件", callback_data="regions")],
+            [InlineKeyboardButton("🤖 AI 評估", callback_data="ai")],
             [InlineKeyboardButton("🕒 執行排程", callback_data="schedule")],
             [InlineKeyboardButton("▶️ 立即執行爬蟲", callback_data="run")],
             [InlineKeyboardButton("⚠️ 結果不明通知", callback_data="pending")],
@@ -317,6 +319,36 @@ def _kinds_view(data, region_id):
         "未勾選時代表全部類型。" if not selected else f"已選擇 {len(selected)} 種類型。"
     )
     return f"{REGIONS[region_id]}物件類型\n\n{note}", InlineKeyboardMarkup(rows)
+
+
+def _ai_view(data):
+    ai = data.get("ai") or {}
+    enabled = bool(ai.get("enabled"))
+    filter_mode = bool(ai.get("filter", True))
+    model = ai.get("model") or DEFAULT_MODEL
+    criteria = (ai.get("criteria") or "").strip() or "（使用預設標準）"
+    key_status = "已設定" if api_key_from_env() else f"未設定（環境變數 {API_KEY_ENV}）"
+    text = (
+        "AI 物件評估\n\n"
+        f"狀態：{'啟用' if enabled else '停用'}\n"
+        f"模式：{'過濾不推薦的物件' if filter_mode else '僅在通知中標註評語'}\n"
+        f"模型：{model}\n"
+        f"API 金鑰：{key_status}\n"
+        f"評估標準：{criteria}"
+    )
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "停用 AI 評估" if enabled else "啟用 AI 評估",
+                callback_data="ai_toggle",
+            )
+        ],
+        [InlineKeyboardButton("切換模式（過濾／標註）", callback_data="ai_mode")],
+        [InlineKeyboardButton("✏️ 評估標準", callback_data="ai_criteria")],
+        [InlineKeyboardButton("✏️ 模型", callback_data="ai_model")],
+        [InlineKeyboardButton("⬅️ 主選單", callback_data="home")],
+    ]
+    return text, InlineKeyboardMarkup(buttons)
 
 
 def _format_price(price_min, price_max):
@@ -441,12 +473,19 @@ def _format_schedule(expression):
 
 
 def _config_summary(data):
+    ai = data.get("ai") or {}
+    if ai.get("enabled"):
+        mode = "過濾模式" if ai.get("filter", True) else "標註模式"
+        ai_text = f"啟用（{mode}，{ai.get('model') or DEFAULT_MODEL}）"
+    else:
+        ai_text = "停用"
     lines = [
         "目前設定",
         "",
         "排程：",
         f"  執行頻率：{_format_schedule(data['schedule'])}",
         f"  時區：{data['timezone']}",
+        f"AI 評估：{ai_text}",
         "已啟用縣市：",
     ]
     if not data["crawl"]:
@@ -512,6 +551,15 @@ def _listing_message(region, listing):
     ]
     if details:
         lines.append(f"🏢 {details}")
+    verdict = listing.get("ai")
+    if isinstance(verdict, dict):
+        good = bool(verdict.get("good"))
+        score = verdict.get("score")
+        score_text = f"（{score}/10）" if isinstance(score, int) else ""
+        lines.append(f"🤖 AI 評估：{'✅ 推薦' if good else '⚠️ 不推薦'}{score_text}")
+        reason = str(verdict.get("reason") or "").strip()
+        if reason:
+            lines.append(f"💭 {reason}")
     if listing.get("url"):
         lines.extend(["", listing["url"]])
     return "\n".join(lines)
@@ -534,6 +582,9 @@ def _usable_image_urls(values):
 
 async def _listing_images(listing):
     """Load the listing's detail-page album, falling back to its thumbnail."""
+    preloaded = _usable_image_urls(listing.get("images") or [])
+    if preloaded:
+        return preloaded
     fallback = _usable_image_urls([listing.get("image")])
     url = listing.get("url")
     if not url:
@@ -599,11 +650,13 @@ def _format_crawl_summary(summary):
     for region in summary.get("regions", []):
         processed = region.get("processed", region["crawled"])
         retried = region.get("retried", 0)
+        filtered = region.get("filtered", 0)
+        filtered_text = f"、AI 過濾 {filtered} 筆" if filtered else ""
         lines.append(
             f"{region['region']}：總處理 {processed} 筆"
             f"（本次爬取 {region['crawled']} 筆、其中重試 {retried} 筆）、"
-            f"已匹配 {region['matched']} 筆、新推送 {region['pushed']} 筆、"
-            f"推送失敗 {region.get('failed', 0)} 筆"
+            f"已匹配 {region['matched']} 筆、新推送 {region['pushed']} 筆"
+            f"{filtered_text}、推送失敗 {region.get('failed', 0)} 筆"
         )
     return "\n".join(lines)
 
@@ -681,6 +734,31 @@ async def _run_crawler(application, status_chat_id=None):
             await application.bot.send_message(status_chat_id, "尚未啟用任何縣市。")
         return None
 
+    evaluate = None
+    ai_config = data.get("ai") or {}
+    if ai_config.get("enabled"):
+        api_key = api_key_from_env()
+        if not api_key:
+            LOGGER.warning(
+                "AI evaluation is enabled but %s is not set; continuing without AI",
+                API_KEY_ENV,
+            )
+        else:
+            filter_rejected = ai_config.get("filter", True)
+
+            async def evaluate(region, listing):
+                verdict, images = await asyncio.to_thread(
+                    evaluate_listing,
+                    ai_config,
+                    region,
+                    listing,
+                    api_key=api_key,
+                )
+                listing["ai"] = verdict
+                if images:
+                    listing["images"] = images
+                return bool(verdict["good"]) or not filter_rejected
+
     async def notify(region, listing):
         text = _listing_message(region, listing)
         images = await _listing_images(listing)
@@ -722,7 +800,10 @@ async def _run_crawler(application, status_chat_id=None):
             "manual" if status_chat_id else "scheduled",
             len(data["crawl"]),
         )
-        summary = await crawl_and_notify(_store(application).path, notify)
+        crawl_kwargs = {"evaluate": evaluate} if evaluate is not None else {}
+        summary = await crawl_and_notify(
+            _store(application).path, notify, **crawl_kwargs
+        )
     except Exception:
         LOGGER.exception(
             "Crawl execution failed trigger=%s",
@@ -887,6 +968,25 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "請輸入 -，例如：10000 30000 或 40000 -"
         )
         return
+    elif action == "ai":
+        view = _ai_view(store.load())
+    elif action == "ai_toggle":
+        store.set_ai_enabled(not store.load()["ai"]["enabled"])
+        view = _ai_view(store.load())
+    elif action == "ai_mode":
+        store.set_ai_filter(not store.load()["ai"]["filter"])
+        view = _ai_view(store.load())
+    elif action == "ai_criteria":
+        context.user_data["awaiting"] = ("ai_criteria", None)
+        await query.message.reply_text(
+            "請輸入 AI 評估標準，例如：預算兩萬內、重視採光、近捷運。"
+            "輸入 - 可恢復預設標準。"
+        )
+        return
+    elif action == "ai_model":
+        context.user_data["awaiting"] = ("ai_model", None)
+        await query.message.reply_text("請輸入 OpenCode Go 模型 ID，例如：kimi-k3")
+        return
     elif action == "schedule":
         view = _schedule_view(store.load())
     elif action.startswith("schedule_set:"):
@@ -953,6 +1053,32 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         store.set_schedule(value)
         reschedule(context.application)
         await update.effective_message.reply_text("排程已更新。請使用 /menu 繼續設定。")
+        return
+
+    if kind == "ai_criteria":
+        try:
+            store.set_ai_criteria(None if value == "-" else value)
+        except ValueError:
+            context.user_data["awaiting"] = awaiting
+            await update.effective_message.reply_text(
+                "評估標準不可為空，且最多 2,000 個字元。"
+            )
+            return
+        await update.effective_message.reply_text(
+            "AI 評估標準已更新。請使用 /menu 繼續設定。"
+        )
+        return
+
+    if kind == "ai_model":
+        try:
+            store.set_ai_model(value)
+        except ValueError:
+            context.user_data["awaiting"] = awaiting
+            await update.effective_message.reply_text("模型 ID 無效，例如：kimi-k3")
+            return
+        await update.effective_message.reply_text(
+            "AI 模型已更新。請使用 /menu 繼續設定。"
+        )
         return
 
     match = re.fullmatch(r"\s*(\d+|-)\s+(\d+|-)\s*", value)

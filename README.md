@@ -1,15 +1,16 @@
 # 591 Telegram 租屋通知機器人
 
 爬取 591 租屋搜尋結果，將新物件傳送給指定的 Telegram 使用者，並以 SQLite
-避免重複通知。縣市、行政區、物件類型、租金與 cron 排程都能透過按鈕設定。
+避免重複通知。縣市、行政區、物件類型、租金、AI 評估與 cron 排程都能透過按鈕設定。
 
 ## 功能
 
 - 每次讀取前 5 頁，每個縣市最多處理 150 筆結果。
 - 每筆通知會從物件詳情頁載入照片，並以 Telegram 相簿傳送最多 10 張。
+- 可選擇使用 OpenCode Go AI，依完整詳情與照片評估物件，並將推薦結果與理由附在通知中。
 - 每個縣市使用獨立 SQLite 資料表。
-- 只有 Telegram 接受通知後才保存完整物件資料。
-- 每次排程爬取完成後，Telegram 會回報各縣市的處理、重試、已匹配、新推送與失敗筆數。
+- Telegram 接受通知或 AI 過濾後才保存完整物件資料。
+- 每次排程爬取完成後，Telegram 會回報各縣市的處理、重試、已匹配、新推送、AI 過濾與失敗筆數。
 - 使用 `TELEGRAM_ALLOWED_USER_ID` 限制單一擁有者與私人聊天室。
 - 支援自訂五欄式 cron、Docker 與 amd64/arm64 映像。
 
@@ -23,6 +24,7 @@ docker run -d \
   --restart unless-stopped \
   -e TELEGRAM_BOT_TOKEN="你的 bot token" \
   -e TELEGRAM_ALLOWED_USER_ID="你的 Telegram user ID" \
+  -e OPENCODE_GO_API_KEY="你的 OpenCode Go API key" \
   -v 591-notifier-data:/data \
   ghcr.io/tsunderechen/591_notifier:latest
 ```
@@ -47,6 +49,13 @@ telegram:
   owner_user_id:
   chat_id:
 
+ai:
+  enabled: false
+  filter: true
+  model: kimi-k3
+  criteria:
+  max_images: 6
+
 crawl:
   - region: 新北市
     sections: [土城區, 中和區]
@@ -56,6 +65,20 @@ crawl:
 
 `sections`、`kinds` 與 `price` 可留空。同一縣市只能設定一次；相對的資料庫路徑
 以 YAML 所在目錄為基準。
+
+## AI 物件評估
+
+在 OpenCode Zen 訂閱 Go 後，將 API key 設為 `OPENCODE_GO_API_KEY`，再從 Telegram
+選單的「🤖 AI 評估」啟用功能。預設模型為 `kimi-k3`，可在選單或 YAML 的
+`ai.model` 改為其他 OpenCode Go 模型。
+
+AI 會使用物件詳情頁的文字欄位、描述、設備、租住說明和最多 `ai.max_images`
+張照片，回傳推薦與 0 到 10 分評分。`ai.criteria` 可填入個人偏好，例如「預算
+兩萬內、重視採光、步行十分鐘內到捷運」。
+
+- `ai.filter: true`：AI 不推薦的物件不會通知，且會保存為已處理，避免下次重複評估。
+- `ai.filter: false`：所有新物件都會通知，並在訊息內附上 AI 評語。
+- AI 或詳情頁暫時失敗時採取 fail-open 行為：仍通知物件，避免遺漏可能合適的房源。
 
 ## 通知去重
 

@@ -6,6 +6,7 @@ import copy
 import fcntl
 import logging
 import os
+import re
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
@@ -15,6 +16,12 @@ from typing import Any
 
 import yaml
 
+from .ai import (
+    DEFAULT_MAX_IMAGES,
+    DEFAULT_MODEL,
+    MAX_CRITERIA_CHARS,
+    MAX_IMAGES_LIMIT,
+)
 from .crawler import (
     KINDS,
     REGIONS,
@@ -32,8 +39,17 @@ DEFAULT_CONFIG = {
     "schedule": "*/15 * * * *",
     "timezone": "Asia/Taipei",
     "telegram": {"owner_user_id": None, "chat_id": None},
+    "ai": {
+        "enabled": False,
+        "filter": True,
+        "model": DEFAULT_MODEL,
+        "criteria": None,
+        "max_images": DEFAULT_MAX_IMAGES,
+    },
     "crawl": [],
 }
+
+MODEL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class InstanceLock:
@@ -145,6 +161,48 @@ class ConfigStore:
         telegram["chat_id"] = cls._optional_integer(
             telegram["chat_id"], "telegram.chat_id"
         )
+
+        ai = result.get("ai")
+        if not isinstance(ai, dict):
+            raise ValueError("'ai' must be a mapping")
+        unknown_ai_keys = set(ai) - {
+            "enabled",
+            "filter",
+            "model",
+            "criteria",
+            "max_images",
+        }
+        if unknown_ai_keys:
+            raise ValueError(f"'ai' has unknown keys: {sorted(unknown_ai_keys)}")
+        ai.setdefault("enabled", False)
+        ai.setdefault("filter", True)
+        ai.setdefault("model", DEFAULT_MODEL)
+        ai.setdefault("criteria", None)
+        ai.setdefault("max_images", DEFAULT_MAX_IMAGES)
+        if not isinstance(ai["enabled"], bool):
+            raise ValueError("'ai.enabled' must be a boolean")
+        if not isinstance(ai["filter"], bool):
+            raise ValueError("'ai.filter' must be a boolean")
+        if not isinstance(ai["model"], str) or not MODEL_ID_PATTERN.fullmatch(
+            ai["model"]
+        ):
+            raise ValueError("'ai.model' must be a valid model id")
+        if ai["criteria"] is not None and (
+            not isinstance(ai["criteria"], str) or not ai["criteria"].strip()
+        ):
+            raise ValueError("'ai.criteria' must be a non-empty string or null")
+        if ai["criteria"] is not None and len(ai["criteria"]) > MAX_CRITERIA_CHARS:
+            raise ValueError(
+                f"'ai.criteria' must be at most {MAX_CRITERIA_CHARS} characters"
+            )
+        if (
+            not isinstance(ai["max_images"], int)
+            or isinstance(ai["max_images"], bool)
+            or not 1 <= ai["max_images"] <= MAX_IMAGES_LIMIT
+        ):
+            raise ValueError(
+                f"'ai.max_images' must be an integer between 1 and {MAX_IMAGES_LIMIT}"
+            )
 
         crawl = result.get("crawl")
         if not isinstance(crawl, list):
@@ -368,3 +426,31 @@ class ConfigStore:
         if not isinstance(expression, str) or not expression.strip():
             raise ValueError("schedule must be a non-empty cron expression")
         return self.update(lambda data: data.__setitem__("schedule", expression))
+
+    def set_ai_enabled(self, enabled: bool):
+        return self.update(
+            lambda data: data["ai"].__setitem__("enabled", bool(enabled))
+        )
+
+    def set_ai_filter(self, enabled: bool):
+        return self.update(lambda data: data["ai"].__setitem__("filter", bool(enabled)))
+
+    def set_ai_model(self, model: str):
+        if not isinstance(model, str) or not MODEL_ID_PATTERN.fullmatch(model.strip()):
+            raise ValueError("model must be a valid model id")
+        return self.update(lambda data: data["ai"].__setitem__("model", model.strip()))
+
+    def set_ai_criteria(self, criteria: str | None):
+        if criteria is not None and (
+            not isinstance(criteria, str) or not criteria.strip()
+        ):
+            raise ValueError("criteria must be a non-empty string or None")
+        if criteria is not None and len(criteria.strip()) > MAX_CRITERIA_CHARS:
+            raise ValueError(
+                f"criteria must be at most {MAX_CRITERIA_CHARS} characters"
+            )
+        return self.update(
+            lambda data: data["ai"].__setitem__(
+                "criteria", criteria.strip() if criteria else None
+            )
+        )

@@ -19,6 +19,7 @@ from .database import (
     load_config,
     mark_delivery_ambiguous,
     notified_listing_ids,
+    record_filtered_listing,
     reserve_delivery,
     retryable_deliveries,
 )
@@ -69,6 +70,7 @@ async def crawl_and_notify(
     config_path,
     notify: Callable[[str, dict[str, Any]], Awaitable[Any]],
     run_in_thread: bool = True,
+    evaluate: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
     """Notify listings from five pages per county with durable deduplication.
 
@@ -76,6 +78,11 @@ async def crawl_and_notify(
     the outcome becomes uncertain, that ID is marked ambiguous and retried by
     the next crawl. Full listing data is written only after Telegram accepts the
     notification.
+
+    When ``evaluate`` is given, each new listing is passed to it before
+    delivery; returning False records the listing as filtered (never notified
+    or evaluated again). Evaluation failures fail open: the listing is
+    delivered without a verdict.
     """
     run_id = uuid.uuid4().hex[:12]
     started = time.monotonic()
@@ -88,6 +95,7 @@ async def crawl_and_notify(
         "ambiguous": 0,
         "retried": 0,
         "parse_failed": 0,
+        "filtered": 0,
         "regions": [],
     }
 
@@ -168,6 +176,7 @@ async def crawl_and_notify(
                 "matched": 0,
                 "pushed": 0,
                 "failed": 0,
+                "filtered": 0,
             }
             summary["regions"].append(region_summary)
             kwargs = {
@@ -310,6 +319,51 @@ async def crawl_and_notify(
                     region_summary["matched"] += 1
                     continue
 
+                if evaluate is not None and not was_pending:
+                    try:
+                        deliver = await evaluate(region_name, listing)
+                    except Exception:
+                        LOGGER.warning(
+                            "Listing evaluation failed; delivering anyway run_id=%s "
+                            "region=%s listing_id=%s",
+                            run_id,
+                            region_name,
+                            listing_id,
+                            exc_info=True,
+                        )
+                        deliver = True
+                    if not deliver:
+                        try:
+                            await _sync_call(
+                                run_in_thread,
+                                record_filtered_listing,
+                                conn,
+                                region_id,
+                                listing,
+                                _utc_now(),
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "Could not record filtered listing run_id=%s "
+                                "region=%s listing_id=%s",
+                                run_id,
+                                region_name,
+                                listing_id,
+                            )
+                            summary["failed"] += 1
+                            region_summary["failed"] += 1
+                            continue
+                        summary["filtered"] += 1
+                        region_summary["filtered"] += 1
+                        LOGGER.info(
+                            "Listing filtered before notification run_id=%s "
+                            "region=%s listing_id=%s",
+                            run_id,
+                            region_name,
+                            listing_id,
+                        )
+                        continue
+
                 delivery_kind = "retry" if was_pending else "new"
                 attempt_now = _utc_now()
                 reservation = await _sync_call(
@@ -415,7 +469,7 @@ async def crawl_and_notify(
                 )
             LOGGER.info(
                 "Crawl region complete run_id=%s region=%s crawled=%s processed=%s "
-                "matched=%s delivered=%s failed=%s retried=%s",
+                "matched=%s delivered=%s failed=%s retried=%s filtered=%s",
                 run_id,
                 region_name,
                 region_summary["crawled"],
@@ -424,6 +478,7 @@ async def crawl_and_notify(
                 region_summary["pushed"],
                 region_summary["failed"],
                 region_summary["retried"],
+                region_summary["filtered"],
             )
     except Exception:
         LOGGER.exception(
@@ -437,7 +492,7 @@ async def crawl_and_notify(
             await _sync_call(run_in_thread, conn.close)
     LOGGER.info(
         "Crawl completed run_id=%s elapsed_ms=%s fetched=%s notified=%s "
-        "matched=%s failed=%s retried=%s parser_skipped=%s",
+        "matched=%s failed=%s retried=%s parser_skipped=%s filtered=%s",
         run_id,
         round((time.monotonic() - started) * 1000),
         summary["fetched"],
@@ -446,5 +501,6 @@ async def crawl_and_notify(
         summary["failed"],
         summary["retried"],
         summary["parse_failed"],
+        summary["filtered"],
     )
     return summary

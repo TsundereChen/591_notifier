@@ -14,6 +14,13 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     initial = store.load()
     assert initial["schedule"] == "*/15 * * * *"
     assert initial["crawl"] == []
+    assert initial["ai"] == {
+        "enabled": False,
+        "filter": True,
+        "model": "kimi-k3",
+        "criteria": None,
+        "max_images": 6,
+    }
 
     store.set_owner(123, 456)
     store.toggle_region(3)
@@ -21,10 +28,21 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     store.toggle_kind(3, 1)
     store.set_price(3, 10000, 30000)
     store.set_schedule("0 * * * *")
+    store.set_ai_enabled(True)
+    store.set_ai_filter(False)
+    store.set_ai_model("mimo-v2-omni")
+    store.set_ai_criteria("重視採光與捷運距離")
 
     reloaded = ConfigStore(path).load()
     assert reloaded["telegram"] == {"owner_user_id": 123, "chat_id": 456}
     assert reloaded["schedule"] == "0 * * * *"
+    assert reloaded["ai"] == {
+        "enabled": True,
+        "filter": False,
+        "model": "mimo-v2-omni",
+        "criteria": "重視採光與捷運距離",
+        "max_images": 6,
+    }
     assert reloaded["crawl"] == [
         {
             "region": "新北市",
@@ -128,3 +146,20 @@ def test_instance_lock_rejects_second_process_lock(tmp_path):
 
     second = store.acquire_instance_lock()
     second.close()
+
+
+@pytest.mark.parametrize(
+    ("ai_config", "message"),
+    [
+        ("enabled: nope", "ai.enabled"),
+        ("filter: nope", "ai.filter"),
+        ("model: invalid model", "ai.model"),
+        ("max_images: 11", "ai.max_images"),
+    ],
+)
+def test_invalid_ai_configuration_is_rejected(tmp_path, ai_config, message):
+    path = tmp_path / "config.yaml"
+    path.write_text(f"ai:\n  {ai_config}\ncrawl: []\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        ConfigStore(path)

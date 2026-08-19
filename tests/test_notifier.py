@@ -122,6 +122,7 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
         "ambiguous": 1,
         "retried": 0,
         "parse_failed": 0,
+        "filtered": 0,
         "regions": [
             {
                 "region": "新北市",
@@ -131,11 +132,13 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
                 "matched": 1,
                 "pushed": 1,
                 "failed": 1,
+                "filtered": 0,
             }
         ],
     }
     assert summary["regions"][0]["processed"] == sum(
-        summary["regions"][0][key] for key in ("matched", "pushed", "failed")
+        summary["regions"][0][key]
+        for key in ("matched", "pushed", "failed", "filtered")
     )
     conn = init_db(db_path)
     assert listing_exists(conn, 3, "new")
@@ -163,6 +166,7 @@ async def test_store_only_after_success_and_quarantine_uncertain_failures(tmp_pa
             "matched": 2,
             "pushed": 1,
             "failed": 0,
+            "filtered": 0,
         }
     ]
 
@@ -236,6 +240,7 @@ async def test_summary_includes_each_countys_crawled_matched_and_pushed_items(tm
             "matched": 1,
             "pushed": 1,
             "failed": 0,
+            "filtered": 0,
         },
         {
             "region": "台北市",
@@ -245,6 +250,7 @@ async def test_summary_includes_each_countys_crawled_matched_and_pushed_items(tm
             "matched": 0,
             "pushed": 1,
             "failed": 0,
+            "filtered": 0,
         },
     ]
 
@@ -275,6 +281,7 @@ async def test_pending_delivery_retries_after_it_drops_out_of_crawled_page(tmp_p
             "matched": 0,
             "pushed": 1,
             "failed": 0,
+            "filtered": 0,
         }
     ]
     assert attempts == ["gone", "gone"]
@@ -381,3 +388,74 @@ async def test_telegram_receipt_is_persisted(tmp_path):
     ).fetchone()
     conn.close()
     assert row == ("sent", 123, 456)
+
+
+@pytest.mark.asyncio
+async def test_ai_filtered_listing_is_recorded_without_notification(tmp_path):
+    config_path, db_path = write_config(tmp_path, "  - region: 新北市\n")
+    response = payload("新北市", [listing("filtered")])
+    evaluated = []
+    notifications = []
+
+    async def evaluate(_, item):
+        evaluated.append(item["id"])
+        item["ai"] = {"good": False, "score": 2, "reason": "屋況不佳"}
+        return False
+
+    async def notify(_, item):
+        notifications.append(item["id"])
+
+    with mock.patch("rent591_notifier.notifier.crawl_rent_list", return_value=response):
+        first = await crawl_and_notify(
+            config_path, notify, run_in_thread=False, evaluate=evaluate
+        )
+        second = await crawl_and_notify(
+            config_path, notify, run_in_thread=False, evaluate=evaluate
+        )
+
+    assert notifications == []
+    assert evaluated == ["filtered"]
+    assert first["filtered"] == 1
+    assert first["regions"] == [
+        {
+            "region": "新北市",
+            "crawled": 1,
+            "processed": 1,
+            "retried": 0,
+            "matched": 0,
+            "pushed": 0,
+            "failed": 0,
+            "filtered": 1,
+        }
+    ]
+    assert second["filtered"] == 0
+    assert second["skipped"] == 1
+    conn = init_db(db_path)
+    assert listing_exists(conn, 3, "filtered")
+    raw = conn.execute(
+        "SELECT raw FROM 'listings_新北市' WHERE id = 'filtered'"
+    ).fetchone()[0]
+    conn.close()
+    assert json.loads(raw)["ai"]["good"] is False
+
+
+@pytest.mark.asyncio
+async def test_ai_evaluation_failure_fails_open(tmp_path):
+    config_path, _ = write_config(tmp_path, "  - region: 新北市\n")
+    response = payload("新北市", [listing("fallback")])
+    notifications = []
+
+    async def evaluate(_, __):
+        raise RuntimeError("AI unavailable")
+
+    async def notify(_, item):
+        notifications.append(item["id"])
+
+    with mock.patch("rent591_notifier.notifier.crawl_rent_list", return_value=response):
+        summary = await crawl_and_notify(
+            config_path, notify, run_in_thread=False, evaluate=evaluate
+        )
+
+    assert notifications == ["fallback"]
+    assert summary["notified"] == 1
+    assert summary["filtered"] == 0

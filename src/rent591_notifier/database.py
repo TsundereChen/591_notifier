@@ -665,6 +665,21 @@ def _listing_values(
     )
 
 
+def record_filtered_listing(
+    conn: sqlite3.Connection,
+    region: int | str,
+    listing: dict[str, Any],
+    now: str,
+) -> bool:
+    """Record a listing filtered out before notification (e.g. by AI).
+
+    The row is stored with notification_status 'sent' and no Telegram receipt,
+    meaning "handled without notification": it will neither be notified nor
+    evaluated again.
+    """
+    return insert_notified_listing(conn, listing, region, now, attempt_count=0)
+
+
 def insert_notified_listing(
     conn: sqlite3.Connection,
     listing: dict[str, Any],

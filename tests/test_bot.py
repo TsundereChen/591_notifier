@@ -14,6 +14,7 @@ from rent591_notifier.bot import (
     MAX_IMAGES_PER_LISTING,
     _allowed_user_id,
     _adjust_price_bound,
+    _ai_view,
     _authorized,
     _config_summary,
     _cron_trigger,
@@ -203,6 +204,47 @@ def test_listing_message_omits_empty_optional_details():
     assert "https://" not in text
 
 
+def test_listing_message_includes_ai_verdict():
+    text = _listing_message(
+        "新北市",
+        {
+            "title": "AI evaluated listing",
+            "ai": {"good": False, "score": 3, "reason": "租金偏高"},
+        },
+    )
+
+    assert "🤖 AI 評估：⚠️ 不推薦（3/10）" in text
+    assert "💭 租金偏高" in text
+
+
+def test_ai_view_shows_status_and_controls(monkeypatch):
+    monkeypatch.setattr(bot, "api_key_from_env", lambda: "configured")
+
+    text, keyboard = _ai_view(
+        {
+            "ai": {
+                "enabled": True,
+                "filter": False,
+                "model": "kimi-k3",
+                "criteria": "重視採光",
+            }
+        }
+    )
+
+    assert "狀態：啟用" in text
+    assert "僅在通知中標註評語" in text
+    assert "API 金鑰：已設定" in text
+    assert "評估標準：重視採光" in text
+    assert {
+        button.callback_data for row in keyboard.inline_keyboard for button in row
+    } >= {
+        "ai_toggle",
+        "ai_mode",
+        "ai_criteria",
+        "ai_model",
+    }
+
+
 @pytest.mark.asyncio
 async def test_listing_images_loads_detail_album_deduplicates_and_caps(monkeypatch):
     images = [f"https://img.591.com.tw/{index}.jpg" for index in range(12)]
@@ -242,6 +284,22 @@ async def test_listing_images_falls_back_to_list_thumbnail(monkeypatch):
     )
 
     assert result == ["https://img.591.com.tw/thumbnail.jpg"]
+
+
+@pytest.mark.asyncio
+async def test_listing_images_reuses_ai_loaded_album(monkeypatch):
+    detail_crawl = MagicMock()
+    monkeypatch.setattr(bot, "crawl_rent_details", detail_crawl)
+
+    result = await _listing_images(
+        {"images": ["https://img.591.com.tw/one.jpg", "https://img.591.com.tw/two.jpg"]}
+    )
+
+    assert result == [
+        "https://img.591.com.tw/one.jpg",
+        "https://img.591.com.tw/two.jpg",
+    ]
+    detail_crawl.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -327,6 +385,24 @@ def test_crawl_summary_lists_each_countys_requested_counts():
         "台北市：總處理 2 筆（本次爬取 2 筆、其中重試 0 筆）、"
         "已匹配 0 筆、新推送 1 筆、推送失敗 1 筆"
     )
+
+
+def test_crawl_summary_includes_filtered_count():
+    text = _format_crawl_summary(
+        {
+            "regions": [
+                {
+                    "region": "新北市",
+                    "crawled": 3,
+                    "matched": 0,
+                    "pushed": 1,
+                    "filtered": 2,
+                }
+            ]
+        }
+    )
+
+    assert "AI 過濾 2 筆" in text
 
 
 def test_config_summary_is_structured_and_human_readable():
@@ -547,6 +623,33 @@ async def test_callback_dispatches_all_configuration_actions(bot_harness, monkey
     edits_before_unknown = harness.query.edit_message_text.await_count
     await press("unknown-action")
     assert harness.query.edit_message_text.await_count == edits_before_unknown
+
+
+@pytest.mark.asyncio
+async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
+    harness = bot_harness
+
+    harness.query.data = "ai_toggle"
+    await callback(harness.update, harness.context)
+    assert harness.store.load()["ai"]["enabled"] is True
+
+    harness.query.data = "ai_mode"
+    await callback(harness.update, harness.context)
+    assert harness.store.load()["ai"]["filter"] is False
+
+    harness.query.data = "ai_criteria"
+    await callback(harness.update, harness.context)
+    assert harness.context.user_data["awaiting"] == ("ai_criteria", None)
+    harness.message.text = "重視採光"
+    await bot.text_input(harness.update, harness.context)
+    assert harness.store.load()["ai"]["criteria"] == "重視採光"
+
+    harness.query.data = "ai_model"
+    await callback(harness.update, harness.context)
+    assert harness.context.user_data["awaiting"] == ("ai_model", None)
+    harness.message.text = "mimo-v2-omni"
+    await bot.text_input(harness.update, harness.context)
+    assert harness.store.load()["ai"]["model"] == "mimo-v2-omni"
 
 
 @pytest.mark.asyncio
@@ -942,6 +1045,32 @@ async def test_scheduled_run_sends_summary_to_bound_chat(bot_harness, monkeypatc
         "新北市：總處理 2 筆（本次爬取 2 筆、其中重試 0 筆）、"
         "已匹配 1 筆、新推送 1 筆、推送失敗 0 筆",
     )
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_wires_ai_evaluation_and_filtering(bot_harness, monkeypatch):
+    bot_harness.store.toggle_region(3)
+    bot_harness.store.set_ai_enabled(True)
+    judge = MagicMock(
+        return_value=(
+            {"good": False, "score": 2, "reason": "屋況不佳"},
+            ["https://img.591.com.tw/one.jpg"],
+        )
+    )
+
+    async def fake_crawl(config_path, notify, *, evaluate):
+        listing = {"id": "abc", "url": "https://rent.591.com.tw/abc"}
+        assert await evaluate("新北市", listing) is False
+        assert listing["ai"]["reason"] == "屋況不佳"
+        assert listing["images"] == ["https://img.591.com.tw/one.jpg"]
+        return {"regions": []}
+
+    monkeypatch.setattr(bot, "api_key_from_env", lambda: "test-key")
+    monkeypatch.setattr(bot, "evaluate_listing", judge)
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+
+    assert await bot._run_crawler(bot_harness.application) == {"regions": []}
+    assert judge.call_args.kwargs["api_key"] == "test-key"
 
 
 @pytest.mark.asyncio
