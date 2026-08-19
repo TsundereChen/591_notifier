@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import ssl
 from typing import Any, Literal
 from urllib.parse import urlparse
 
@@ -66,6 +67,24 @@ class AIEvaluationError(RuntimeError):
 
 class _BadRequestError(AIEvaluationError):
     """An HTTP 400 from the provider; the request may work with fewer options."""
+
+
+class _ImageHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Keep TLS verification while accepting 591's certificate without a SKI."""
+
+    @staticmethod
+    def _ssl_context() -> ssl.SSLContext:
+        context = ssl.create_default_context()
+        context.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
+        return context
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["ssl_context"] = self._ssl_context()
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
+        proxy_kwargs["ssl_context"] = self._ssl_context()
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
 
 
 def api_key_from_env(provider: Literal["go", "zen"] = PROVIDER_GO) -> str | None:
@@ -169,29 +188,33 @@ def _download_image(url: str, timeout: int = 30) -> str | None:
         LOGGER.warning("Skipping image with unexpected host url=%s", url)
         return None
     try:
-        with requests.get(url, headers=HEADERS, timeout=timeout, stream=True) as resp:
-            resp.raise_for_status()
-            mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
-            mime = mime.lower()
-            if not mime.startswith("image/"):
-                LOGGER.warning(
-                    "Skipping image with unexpected content type url=%s type=%s",
-                    url,
-                    mime,
-                )
-                return None
-            chunks = []
-            size = 0
-            for chunk in resp.iter_content(65536):
-                size += len(chunk)
-                if size > MAX_IMAGE_BYTES:
+        with requests.Session() as session:
+            session.mount("https://", _ImageHTTPAdapter())
+            with session.get(
+                url, headers=HEADERS, timeout=timeout, stream=True
+            ) as resp:
+                resp.raise_for_status()
+                mime = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+                mime = mime.lower()
+                if not mime.startswith("image/"):
                     LOGGER.warning(
-                        "Skipping oversized image url=%s max_bytes=%s",
+                        "Skipping image with unexpected content type url=%s type=%s",
                         url,
-                        MAX_IMAGE_BYTES,
+                        mime,
                     )
                     return None
-                chunks.append(chunk)
+                chunks = []
+                size = 0
+                for chunk in resp.iter_content(65536):
+                    size += len(chunk)
+                    if size > MAX_IMAGE_BYTES:
+                        LOGGER.warning(
+                            "Skipping oversized image url=%s max_bytes=%s",
+                            url,
+                            MAX_IMAGE_BYTES,
+                        )
+                        return None
+                    chunks.append(chunk)
     except requests.RequestException:
         LOGGER.warning("Could not download listing image url=%s", url, exc_info=True)
         return None

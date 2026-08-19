@@ -1,6 +1,7 @@
 """Tests for OpenCode Go and Zen listing evaluation."""
 
 import json
+import ssl
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -189,6 +190,14 @@ def test_download_image_rejects_non_591_hosts(monkeypatch):
 
     assert ai._download_image("https://example.com/image.jpg") is None
     request.assert_not_called()
+
+
+def test_image_adapter_keeps_certificate_verification():
+    adapter = ai._ImageHTTPAdapter()
+    context = adapter._ssl_context()
+
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
 
 
 @pytest.mark.parametrize(
