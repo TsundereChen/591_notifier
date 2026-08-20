@@ -156,6 +156,26 @@ def test_evaluate_listing_go_requires_api_key():
         )
 
 
+def test_evaluate_listing_prefers_environment_key_to_saved_key(monkeypatch):
+    post = MagicMock(
+        return_value=chat_response('{"good": true, "score": 8, "reason": "推薦"}')
+    )
+    monkeypatch.setattr(ai.requests, "post", post)
+    monkeypatch.setattr(ai, "_download_image", lambda _: None)
+    monkeypatch.setenv(ai.GO_API_KEY_ENV, "environment-key")
+
+    ai.evaluate_listing(
+        {"api_key": "saved-key"},
+        "新北市",
+        listing(),
+        detail_fetcher=lambda *_args, **_kwargs: detail_payload(),
+    )
+
+    assert post.call_args.kwargs["headers"] == {
+        "Authorization": "Bearer environment-key"
+    }
+
+
 def test_evaluate_listing_retries_without_json_mode_after_bad_request(monkeypatch):
     bad_request = SimpleNamespace(status_code=400, text="unsupported", json=MagicMock())
     post = MagicMock(
@@ -182,6 +202,30 @@ def test_evaluate_listing_retries_without_json_mode_after_bad_request(monkeypatc
     assert "response_format" in post.call_args_list[0].kwargs["json"]
     assert "response_format" not in post.call_args_list[1].kwargs["json"]
     assert len(post.call_args_list[1].kwargs["json"]["messages"][1]["content"]) == 2
+
+
+@pytest.mark.parametrize("status_code", [400, 500])
+def test_chat_completion_does_not_expose_provider_error_body(monkeypatch, status_code):
+    response_body = "provider response containing private listing data"
+    monkeypatch.setattr(
+        ai.requests,
+        "post",
+        MagicMock(
+            return_value=SimpleNamespace(status_code=status_code, text=response_body)
+        ),
+    )
+
+    with pytest.raises(ai.AIEvaluationError) as exc_info:
+        ai._chat_completion(
+            "test-key", "https://provider.example/v1", "test-model", [], json_mode=True
+        )
+
+    assert str(exc_info.value) == (
+        "AI provider rejected the request with HTTP 400"
+        if status_code == 400
+        else "AI provider returned HTTP 500"
+    )
+    assert response_body not in str(exc_info.value)
 
 
 def test_download_image_rejects_non_591_hosts(monkeypatch):

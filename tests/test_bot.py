@@ -248,6 +248,24 @@ def test_ai_view_shows_status_and_controls(monkeypatch):
     }
 
 
+def test_ai_view_recognizes_saved_api_key(monkeypatch):
+    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: None)
+
+    text, _ = _ai_view(
+        {
+            "ai": {
+                "enabled": True,
+                "filter": False,
+                "provider": "go",
+                "model": "kimi-k3",
+                "api_key": "saved-key",
+            }
+        }
+    )
+
+    assert "API 金鑰：已設定" in text
+
+
 @pytest.mark.asyncio
 async def test_listing_images_loads_detail_album_deduplicates_and_caps(monkeypatch):
     images = [f"https://img.591.com.tw/{index}.jpg" for index in range(12)]
@@ -1104,6 +1122,53 @@ async def test_run_crawler_wires_ai_evaluation_and_filtering(bot_harness, monkey
 
 
 @pytest.mark.asyncio
+async def test_run_crawler_logs_ai_evaluation_failure_with_context(
+    bot_harness, monkeypatch, caplog
+):
+    bot_harness.store.toggle_region(3)
+    bot_harness.store.set_ai_enabled(True)
+    judge = MagicMock(side_effect=RuntimeError("AI provider unavailable"))
+
+    async def fake_crawl(config_path, notify, *, evaluate):
+        assert await evaluate("新北市", {"id": "abc"}) is True
+        return {"regions": []}
+
+    caplog.set_level(logging.ERROR, logger="rent591_notifier.bot")
+    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: "test-key")
+    monkeypatch.setattr(bot, "evaluate_listing", judge)
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+
+    assert await bot._run_crawler(bot_harness.application) == {"regions": []}
+    record = caplog.records[-1]
+    assert (
+        "AI evaluation failed; delivering listing without AI verdict" in record.message
+    )
+    assert "region=新北市 listing_id=abc provider=go model=kimi-k3" in record.message
+    assert record.exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_uses_api_key_saved_in_ai_settings(bot_harness, monkeypatch):
+    bot_harness.store.toggle_region(3)
+    bot_harness.store.set_ai_enabled(True)
+    bot_harness.store.set_ai_api_key("saved-key")
+    judge = MagicMock(return_value=({"good": True, "score": 8, "reason": "推薦"}, []))
+
+    async def fake_crawl(config_path, notify, *, evaluate):
+        assert await evaluate(
+            "新北市", {"id": "abc", "url": "https://rent.591.com.tw/abc"}
+        )
+        return {"regions": []}
+
+    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: None)
+    monkeypatch.setattr(bot, "evaluate_listing", judge)
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+
+    assert await bot._run_crawler(bot_harness.application) == {"regions": []}
+    assert judge.call_args.kwargs["api_key"] == "saved-key"
+
+
+@pytest.mark.asyncio
 @pytest.mark.filterwarnings("ignore:Deprecated since version v22.2")
 async def test_run_crawler_reports_exception_and_final_retry_failure(
     bot_harness, monkeypatch
@@ -1278,6 +1343,30 @@ def test_redacting_formatter_hides_token_in_message_and_traceback():
 
     assert token not in exception_message
     assert "request failed for token [REDACTED]" in exception_message
+
+
+def test_redacting_formatter_hides_record_specific_secret_in_traceback():
+    api_key = "secret-ai-key"
+    formatter = bot._RedactingFormatter("%(levelname)s %(message)s")
+
+    try:
+        raise RuntimeError(f"AI request failed with {api_key}")
+    except RuntimeError:
+        record = logging.LogRecord(
+            "rent591_notifier.bot",
+            logging.ERROR,
+            __file__,
+            1,
+            "AI evaluation failed",
+            (),
+            sys.exc_info(),
+        )
+    record.sensitive_values = (api_key,)
+
+    message = formatter.format(record)
+
+    assert api_key not in message
+    assert "AI request failed with [REDACTED]" in message
 
 
 def test_redacting_formatter_hides_unconfigured_telegram_token_shape():

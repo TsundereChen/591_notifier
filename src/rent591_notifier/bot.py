@@ -100,7 +100,10 @@ class _RedactingFormatter(logging.Formatter):
         self.sensitive_values = tuple(sensitive_values)
 
     def format(self, record):
-        return _redact_sensitive_text(super().format(record), self.sensitive_values)
+        sensitive_values = self.sensitive_values + tuple(
+            getattr(record, "sensitive_values", ())
+        )
+        return _redact_sensitive_text(super().format(record), sensitive_values)
 
 
 def _configure_logging(token=None):
@@ -338,17 +341,16 @@ def _ai_view(data):
     model = ai.get("model") or DEFAULT_MODEL
     criteria = (ai.get("criteria") or "").strip() or "（使用預設標準）"
     provider_label = "OpenCode Go" if provider == PROVIDER_GO else "OpenCode Zen"
-    # Determine which API key to check based on provider
+    api_key_configured = bool(ai.get("api_key") or api_key_from_env(provider))
+    # Determine which API key to check based on provider.
     if provider == PROVIDER_GO:
         key_status = (
-            "已設定"
-            if api_key_from_env(PROVIDER_GO)
-            else "未設定（環境變數 OPENCODE_GO_API_KEY）"
+            "已設定" if api_key_configured else "未設定（環境變數 OPENCODE_GO_API_KEY）"
         )
     else:
         key_status = (
             "已設定"
-            if api_key_from_env(PROVIDER_ZEN)
+            if api_key_configured
             else "未設定（環境變數 OPENCODE_ZEN_API_KEY，免費模型可選）"
         )
     text = (
@@ -772,7 +774,9 @@ async def _run_crawler(application, status_chat_id=None):
     ai_config = data.get("ai") or {}
     if ai_config.get("enabled"):
         provider = ai_config.get("provider") or PROVIDER_GO
-        api_key = api_key_from_env(provider)
+        # Environment variables take precedence, but the key entered in the
+        # bot's AI menu is persisted in config.yaml and must work as well.
+        api_key = api_key_from_env(provider) or ai_config.get("api_key")
         # For Zen, allow empty API key (free models)
         if provider == PROVIDER_ZEN and not api_key:
             api_key = None
@@ -787,13 +791,25 @@ async def _run_crawler(application, status_chat_id=None):
             filter_rejected = ai_config.get("filter", True)
 
             async def evaluate(region, listing):
-                verdict, images = await asyncio.to_thread(
-                    evaluate_listing,
-                    ai_config,
-                    region,
-                    listing,
-                    api_key=api_key,
-                )
+                try:
+                    verdict, images = await asyncio.to_thread(
+                        evaluate_listing,
+                        ai_config,
+                        region,
+                        listing,
+                        api_key=api_key,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "AI evaluation failed; delivering listing without AI verdict "
+                        "region=%s listing_id=%s provider=%s model=%s",
+                        region,
+                        listing.get("id", "unknown"),
+                        provider,
+                        ai_config.get("model") or DEFAULT_MODEL,
+                        extra={"sensitive_values": (api_key,)},
+                    )
+                    return True
                 listing["ai"] = verdict
                 if images:
                     listing["images"] = images

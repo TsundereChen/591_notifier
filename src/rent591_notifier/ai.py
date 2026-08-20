@@ -250,11 +250,9 @@ def _chat_completion(
     except requests.RequestException as exc:
         raise AIEvaluationError(f"AI request failed: {exc}") from exc
     if resp.status_code == 400:
-        raise _BadRequestError(f"AI provider rejected the request: {resp.text[:200]}")
+        raise _BadRequestError("AI provider rejected the request with HTTP 400")
     if resp.status_code != 200:
-        raise AIEvaluationError(
-            f"AI provider returned HTTP {resp.status_code}: {resp.text[:200]}"
-        )
+        raise AIEvaluationError(f"AI provider returned HTTP {resp.status_code}")
     try:
         content = resp.json()["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as exc:
@@ -312,11 +310,12 @@ def evaluate_listing(
     if provider not in PROVIDER_CHOICES:
         provider = DEFAULT_PROVIDER
 
-    # API key: from config (ai.api_key), then env, then None (for Zen free models)
+    # An explicit value is useful to callers; otherwise use the deployment
+    # environment before the key persisted in the local configuration.
     config_api_key = ai_config.get("api_key")
-    api_key = api_key if api_key is not None else config_api_key
+    api_key = api_key if api_key is not None else api_key_from_env(provider)
     if not api_key:
-        api_key = api_key_from_env(provider)
+        api_key = config_api_key
 
     # For Zen, allow empty API key (free models)
     if provider == PROVIDER_ZEN and not api_key:
