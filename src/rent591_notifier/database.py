@@ -20,9 +20,10 @@ from .crawler import (
     _resolve_sections,
     _validate_price_range,
 )
+from .keyword_filter import normalize_keywords
 
 DEFAULT_DB = "listings.db"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LOGGER = logging.getLogger(__name__)
 
 
@@ -84,7 +85,7 @@ CREATE TABLE IF NOT EXISTS {table} (
     last_seen           TEXT NOT NULL,
     raw                 TEXT,
     notification_status TEXT NOT NULL DEFAULT 'sent'
-        CHECK (notification_status IN ('sent', 'unknown')),
+        CHECK (notification_status IN ('sent', 'filtered', 'unknown')),
     notified_at         TEXT,
     telegram_chat_id    INTEGER,
     telegram_message_id INTEGER
@@ -135,6 +136,41 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+def _table_sql(conn: sqlite3.Connection, table: str) -> str:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    return str(row[0]) if row and row[0] is not None else ""
+
+
+def _rebuild_region_table_for_filtered_status(
+    conn: sqlite3.Connection, table: str
+) -> None:
+    """Expand an existing notification_status CHECK without losing rows."""
+    temporary = f"{table}__status_v4"
+    quoted_table = _quote_identifier(table)
+    quoted_temporary = _quote_identifier(temporary)
+    conn.execute(f"DROP TABLE IF EXISTS {quoted_temporary}")
+    conn.execute(TABLE_SCHEMA.format(table=quoted_temporary))
+
+    columns = _table_columns(conn, table)
+    target_columns = (
+        *BASE_LISTING_COLUMNS,
+        "notification_status",
+        "notified_at",
+        "telegram_chat_id",
+        "telegram_message_id",
+    )
+    copied = [column for column in target_columns if column in columns]
+    column_sql = ", ".join(_quote_identifier(column) for column in copied)
+    conn.execute(
+        f"INSERT INTO {quoted_temporary} ({column_sql}) "
+        f"SELECT {column_sql} FROM {quoted_table}"
+    )
+    conn.execute(f"DROP TABLE {quoted_table}")
+    conn.execute(f"ALTER TABLE {quoted_temporary} RENAME TO {_quote_identifier(table)}")
+
+
 def _ensure_delivery_columns(conn: sqlite3.Connection) -> None:
     """Upgrade an existing delivery ledger without discarding retry state."""
     columns = _table_columns(conn, "delivery_attempts")
@@ -166,7 +202,7 @@ def _ensure_region_table(conn: sqlite3.Connection, region: int | str) -> str:
         additions = {
             "notification_status": (
                 "TEXT NOT NULL DEFAULT 'unknown' "
-                "CHECK (notification_status IN ('sent', 'unknown'))"
+                "CHECK (notification_status IN ('sent', 'filtered', 'unknown'))"
             ),
             "notified_at": "TEXT",
             "telegram_chat_id": "INTEGER",
@@ -178,7 +214,30 @@ def _ensure_region_table(conn: sqlite3.Connection, region: int | str) -> str:
                     f"ALTER TABLE {quoted} ADD COLUMN {_quote_identifier(name)} "
                     f"{declaration}"
                 )
+        if "'filtered'" not in _table_sql(conn, table):
+            _rebuild_region_table_for_filtered_status(conn, table)
     return quoted
+
+
+def _migrate_pre_v4_filtered_listings(conn: sqlite3.Connection) -> None:
+    """Restore the filtered state previously encoded as a zero-attempt send."""
+    rows = conn.execute(
+        "SELECT region_id, listing_id FROM delivery_attempts "
+        "WHERE status = 'sent' AND attempt_count = 0 AND payload IS NOT NULL "
+        "AND telegram_chat_id IS NULL AND telegram_message_id IS NULL"
+    ).fetchall()
+    for region_id, listing_id in rows:
+        table = _ensure_region_table(conn, int(region_id))
+        cursor = conn.execute(
+            f"UPDATE {table} SET notification_status = 'filtered', "
+            "notified_at = NULL WHERE id = ? AND notification_status = 'sent'",
+            (str(listing_id),),
+        )
+        if cursor.rowcount:
+            conn.execute(
+                "DELETE FROM delivery_attempts WHERE region_id = ? AND listing_id = ?",
+                (int(region_id), str(listing_id)),
+            )
 
 
 def _legacy_conflict(
@@ -316,19 +375,24 @@ def load_config(path: str | os.PathLike[str]) -> dict[str, Any]:
         if unknown_price_keys:
             raise ValueError(f"unknown 'price' options: {sorted(unknown_price_keys)}")
         price_min, price_max = _validate_price_range(price.get("min"), price.get("max"))
+        exclude_keywords = normalize_keywords(
+            entry.get("exclude_keywords"),
+            f"crawl entry for {REGIONS[region_id]!r}.exclude_keywords",
+        )
         # `pages` is no longer configurable. Accept the former value for
         # backward compatibility, but all runs now query five pages.
         if entry.get("pages", 5) not in (1, 5):
             raise ValueError("'pages' is fixed at 5 (maximum 150 results per county)")
-        jobs.append(
-            {
-                "region_id": region_id,
-                "section_ids": section_ids,
-                "kind_ids": kind_ids,
-                "price_min": price_min,
-                "price_max": price_max,
-            }
-        )
+        job = {
+            "region_id": region_id,
+            "section_ids": section_ids,
+            "kind_ids": kind_ids,
+            "price_min": price_min,
+            "price_max": price_max,
+        }
+        if exclude_keywords:
+            job["exclude_keywords"] = exclude_keywords
+        jobs.append(job)
 
     database = resolve_database_path(config_path, cfg.get("database", DEFAULT_DB))
 
@@ -351,6 +415,7 @@ def init_db(
     if file_database:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
+    previous_schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     try:
         with conn:
             _migrate_legacy_table(conn)
@@ -358,6 +423,8 @@ def init_db(
             _ensure_delivery_columns(conn)
             for region in regions:
                 _ensure_region_table(conn, region)
+            if previous_schema_version < 4:
+                _migrate_pre_v4_filtered_listings(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     except Exception:
         LOGGER.exception(
@@ -671,13 +738,14 @@ def record_filtered_listing(
     listing: dict[str, Any],
     now: str,
 ) -> bool:
-    """Record a listing filtered out before notification (e.g. by AI).
-
-    The row is stored with notification_status 'sent' and no Telegram receipt,
-    meaning "handled without notification": it will neither be notified nor
-    evaluated again.
-    """
-    return insert_notified_listing(conn, listing, region, now, attempt_count=0)
+    """Record a listing for reevaluation while it remains filtered."""
+    return _upsert_listing(
+        conn,
+        listing,
+        region,
+        now,
+        notification_status="filtered",
+    )
 
 
 def insert_notified_listing(
@@ -691,11 +759,36 @@ def insert_notified_listing(
     attempt_count: int = 1,
 ) -> bool:
     """Atomically record a successful notification and finish its ledger row."""
+    return _upsert_listing(
+        conn,
+        listing,
+        region,
+        now,
+        notification_status="sent",
+        telegram_chat_id=telegram_chat_id,
+        telegram_message_id=telegram_message_id,
+        attempt_count=attempt_count,
+    )
+
+
+def _upsert_listing(
+    conn: sqlite3.Connection,
+    listing: dict[str, Any],
+    region: int | str,
+    now: str,
+    *,
+    notification_status: str,
+    telegram_chat_id: int | None = None,
+    telegram_message_id: int | None = None,
+    attempt_count: int = 0,
+) -> bool:
+    """Store the current listing and its notification decision atomically."""
+    if notification_status not in {"sent", "filtered"}:
+        raise ValueError(f"unsupported notification status {notification_status!r}")
     region_id = _resolve_region(region)
     region_name = REGIONS[region_id]
     table = _ensure_region_table(conn, region_name)
     listing_id = str(listing["id"])
-    already_sent = _notified_exists_in_table(conn, table, listing_id)
     values = _listing_values(listing, region_name, now)
     columns = ", ".join(_quote_identifier(column) for column in BASE_LISTING_COLUMNS)
     placeholders = ", ".join("?" for _ in BASE_LISTING_COLUMNS)
@@ -706,43 +799,86 @@ def insert_notified_listing(
         f"{_quote_identifier(column)} = excluded.{_quote_identifier(column)}"
         for column in update_columns
     )
+    protect_sent = (
+        f"WHERE {table}.notification_status != 'sent'"
+        if notification_status == "filtered"
+        else ""
+    )
     with conn:
+        if notification_status == "filtered":
+            # Acquire the write lock before checking the ledger so owner
+            # reconciliation cannot be replaced by a stale filter decision.
+            conn.execute(
+                "UPDATE delivery_attempts SET updated_at = updated_at "
+                "WHERE region_id = ? AND listing_id = ?",
+                (region_id, listing_id),
+            )
+            delivery_row = conn.execute(
+                "SELECT status FROM delivery_attempts "
+                "WHERE region_id = ? AND listing_id = ?",
+                (region_id, listing_id),
+            ).fetchone()
+            if delivery_row and delivery_row[0] == "sent":
+                return False
+        row = conn.execute(
+            f"SELECT notification_status FROM {table} WHERE id = ?", (listing_id,)
+        ).fetchone()
+        previous_status = str(row[0]) if row else None
         conn.execute(
             f"""
             INSERT INTO {table} (
                 {columns}, notification_status, notified_at,
                 telegram_chat_id, telegram_message_id
-            ) VALUES ({placeholders}, 'sent', ?, ?, ?)
+            ) VALUES ({placeholders}, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 {updates},
-                notification_status = 'sent',
+                notification_status = excluded.notification_status,
                 notified_at = excluded.notified_at,
                 telegram_chat_id = excluded.telegram_chat_id,
                 telegram_message_id = excluded.telegram_message_id
+            {protect_sent}
             """,
-            (*values, now, telegram_chat_id, telegram_message_id),
-        )
-        conn.execute(
-            "INSERT INTO delivery_attempts "
-            "(region_id, listing_id, status, started_at, updated_at, "
-            "telegram_chat_id, telegram_message_id, payload, attempt_count, last_error) "
-            "VALUES (?, ?, 'sent', ?, ?, ?, ?, ?, ?, NULL) "
-            "ON CONFLICT(region_id, listing_id) DO UPDATE SET "
-            "status = 'sent', updated_at = excluded.updated_at, "
-            "telegram_chat_id = excluded.telegram_chat_id, "
-            "telegram_message_id = excluded.telegram_message_id, "
-            "payload = excluded.payload, "
-            "attempt_count = MAX(attempt_count, excluded.attempt_count), "
-            "last_error = NULL",
             (
-                region_id,
-                listing_id,
-                now,
-                now,
+                *values,
+                notification_status,
+                now if notification_status == "sent" else None,
                 telegram_chat_id,
                 telegram_message_id,
-                json.dumps(listing, ensure_ascii=False),
-                attempt_count,
             ),
         )
-    return not already_sent
+        stored_status = str(
+            conn.execute(
+                f"SELECT notification_status FROM {table} WHERE id = ?", (listing_id,)
+            ).fetchone()[0]
+        )
+        if notification_status == "sent":
+            conn.execute(
+                "INSERT INTO delivery_attempts "
+                "(region_id, listing_id, status, started_at, updated_at, "
+                "telegram_chat_id, telegram_message_id, payload, attempt_count, "
+                "last_error) "
+                "VALUES (?, ?, 'sent', ?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(region_id, listing_id) DO UPDATE SET "
+                "status = 'sent', updated_at = excluded.updated_at, "
+                "telegram_chat_id = excluded.telegram_chat_id, "
+                "telegram_message_id = excluded.telegram_message_id, "
+                "payload = excluded.payload, "
+                "attempt_count = MAX(attempt_count, excluded.attempt_count), "
+                "last_error = NULL",
+                (
+                    region_id,
+                    listing_id,
+                    now,
+                    now,
+                    telegram_chat_id,
+                    telegram_message_id,
+                    json.dumps(listing, ensure_ascii=False),
+                    attempt_count,
+                ),
+            )
+        elif stored_status == "filtered":
+            conn.execute(
+                "DELETE FROM delivery_attempts WHERE region_id = ? AND listing_id = ?",
+                (region_id, listing_id),
+            )
+    return stored_status == notification_status and previous_status != stored_status

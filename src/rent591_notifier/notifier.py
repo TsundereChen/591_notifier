@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from .crawler import REGIONS, crawl_rent_list
+from .crawler import KINDS, REGIONS, SECTIONS, crawl_rent_list
 from .database import (
     init_db,
     insert_notified_listing,
@@ -23,6 +23,7 @@ from .database import (
     reserve_delivery,
     retryable_deliveries,
 )
+from .keyword_filter import matched_keyword
 
 PAGES_PER_REGION = 5
 RESULTS_PER_PAGE = 30
@@ -70,19 +71,22 @@ async def crawl_and_notify(
     config_path,
     notify: Callable[[str, dict[str, Any]], Awaitable[Any]],
     run_in_thread: bool = True,
-    evaluate: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None,
+    evaluate: (
+        Callable[[str, dict[str, Any], dict[str, Any]], Awaitable[bool]] | None
+    ) = None,
 ) -> dict[str, Any]:
     """Notify listings from five pages per county with durable deduplication.
 
     A minimal delivery reservation is committed before contacting Telegram. If
     the outcome becomes uncertain, that ID is marked ambiguous and retried by
-    the next crawl. Full listing data is written only after Telegram accepts the
-    notification.
+    the next crawl. Delivered and filtered listings persist their full data,
+    while only delivered listings participate in permanent deduplication.
 
-    When ``evaluate`` is given, each new listing is passed to it before
-    delivery; returning False records the listing as filtered (never notified
-    or evaluated again). Evaluation failures fail open: the listing is
-    delivered without a verdict.
+    When ``evaluate`` is given, each undelivered listing is passed to it with
+    the region and human-readable search filters before delivery; returning
+    False records the listing as filtered. Filtered listings are reconsidered
+    whenever they appear in a later crawl. Evaluation failures fail open: the
+    listing is delivered without a verdict.
     """
     run_id = uuid.uuid4().hex[:12]
     started = time.monotonic()
@@ -183,6 +187,12 @@ async def crawl_and_notify(
                 "region": region_id,
                 "sections": job["section_ids"] or None,
                 "kinds": job["kind_ids"] or None,
+                "price_min": job["price_min"],
+                "price_max": job["price_max"],
+            }
+            crawl_filters = {
+                "sections": [SECTIONS[region_id][sid] for sid in job["section_ids"]],
+                "kinds": [KINDS[kind_id] for kind_id in job["kind_ids"]],
                 "price_min": job["price_min"],
                 "price_max": job["price_max"],
             }
@@ -312,6 +322,42 @@ async def crawl_and_notify(
                 [str(listing["id"]) for listing, _ in work_items],
                 seen_at=_utc_now(),
             )
+
+            async def record_filtered(listing, reason: str) -> bool:
+                listing_id = str(listing["id"])
+                try:
+                    await _sync_call(
+                        run_in_thread,
+                        record_filtered_listing,
+                        conn,
+                        region_id,
+                        listing,
+                        _utc_now(),
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "Could not record filtered listing run_id=%s "
+                        "region=%s listing_id=%s reason=%s",
+                        run_id,
+                        region_name,
+                        listing_id,
+                        reason,
+                    )
+                    summary["failed"] += 1
+                    region_summary["failed"] += 1
+                    return False
+                summary["filtered"] += 1
+                region_summary["filtered"] += 1
+                LOGGER.info(
+                    "Listing filtered before notification run_id=%s region=%s "
+                    "listing_id=%s reason=%s",
+                    run_id,
+                    region_name,
+                    listing_id,
+                    reason,
+                )
+                return True
+
             for listing, was_pending in work_items:
                 listing_id = str(listing["id"])
                 if not was_pending and listing_id in existing:
@@ -319,9 +365,16 @@ async def crawl_and_notify(
                     region_summary["matched"] += 1
                     continue
 
+                if (
+                    matched_keyword(listing, job.get("exclude_keywords", []))
+                    is not None
+                ):
+                    await record_filtered(listing, "keyword")
+                    continue
+
                 if evaluate is not None and not was_pending:
                     try:
-                        deliver = await evaluate(region_name, listing)
+                        deliver = await evaluate(region_name, listing, crawl_filters)
                     except Exception:
                         LOGGER.warning(
                             "Listing evaluation failed; delivering anyway run_id=%s "
@@ -333,35 +386,7 @@ async def crawl_and_notify(
                         )
                         deliver = True
                     if not deliver:
-                        try:
-                            await _sync_call(
-                                run_in_thread,
-                                record_filtered_listing,
-                                conn,
-                                region_id,
-                                listing,
-                                _utc_now(),
-                            )
-                        except Exception:
-                            LOGGER.exception(
-                                "Could not record filtered listing run_id=%s "
-                                "region=%s listing_id=%s",
-                                run_id,
-                                region_name,
-                                listing_id,
-                            )
-                            summary["failed"] += 1
-                            region_summary["failed"] += 1
-                            continue
-                        summary["filtered"] += 1
-                        region_summary["filtered"] += 1
-                        LOGGER.info(
-                            "Listing filtered before notification run_id=%s "
-                            "region=%s listing_id=%s",
-                            run_id,
-                            region_name,
-                            listing_id,
-                        )
+                        await record_filtered(listing, "ai")
                         continue
 
                 delivery_kind = "retry" if was_pending else "new"

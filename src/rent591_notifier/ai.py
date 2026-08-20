@@ -104,6 +104,31 @@ def _section_lines(title: str, pairs: dict[str, Any]) -> list[str]:
     return [f"{title}：{'；'.join(items)}"] if items else []
 
 
+def _crawl_filter_text(region: str, crawl_filters: dict[str, Any] | None) -> str:
+    """Format the search constraints that selected the listing."""
+    crawl_filters = crawl_filters or {}
+    sections = "、".join(str(value) for value in crawl_filters.get("sections") or [])
+    kinds = "、".join(str(value) for value in crawl_filters.get("kinds") or [])
+    price_min = crawl_filters.get("price_min")
+    price_max = crawl_filters.get("price_max")
+    if price_min is None and price_max is None:
+        price = "不限"
+    elif price_min is None:
+        price = f"NT${price_max:,} 以下"
+    elif price_max is None:
+        price = f"NT${price_min:,} 以上"
+    else:
+        price = f"NT${price_min:,}～{price_max:,}"
+    return "\n".join(
+        [
+            f"縣市：{region}",
+            f"行政區：{sections or '不限'}",
+            f"物件類型：{kinds or '不限'}",
+            f"租金範圍：{price}",
+        ]
+    )
+
+
 def _listing_text(region: str, listing: dict[str, Any], detail: dict[str, Any]) -> str:
     """Flatten every structured listing field into a labeled prompt block."""
     lines = []
@@ -299,12 +324,15 @@ def evaluate_listing(
     *,
     detail_fetcher=crawl_rent_details,
     api_key: str | None = None,
+    crawl_filters: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Evaluate one listing and return (verdict, album image URLs).
 
     The verdict is {"good": bool, "score": int | None, "reason": str}. The
     returned image URLs are the detail-page album so callers can reuse them
-    for the Telegram notification without crawling the page twice.
+    for the Telegram notification without crawling the page twice. Optional
+    ``crawl_filters`` contains the human-readable search constraints that
+    selected the listing.
     """
     provider = str(ai_config.get("provider") or DEFAULT_PROVIDER)
     if provider not in PROVIDER_CHOICES:
@@ -354,6 +382,7 @@ def evaluate_listing(
             image_parts.append({"type": "image_url", "image_url": {"url": data_url}})
 
     text = (
+        f"搜尋條件：\n{_crawl_filter_text(region, crawl_filters)}\n\n"
         f"評估標準：\n{criteria}\n\n"
         f"物件資訊：\n{_listing_text(region, listing, detail)}"
     )

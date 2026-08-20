@@ -77,6 +77,17 @@ def test_toggle_and_clear_filters(tmp_path):
     assert store.load()["crawl"] == []
 
 
+def test_exclude_keywords_are_normalized_persisted_and_cleared(tmp_path):
+    store = ConfigStore(tmp_path / "config.yaml")
+    store.toggle_region("新北市")
+
+    store.set_exclude_keywords(3, ["  頂樓加蓋", "PET", "ｐｅｔ"])
+    assert store.load()["crawl"][0]["exclude_keywords"] == ["頂樓加蓋", "PET"]
+
+    store.set_exclude_keywords(3, None)
+    assert "exclude_keywords" not in store.load()["crawl"][0]
+
+
 def test_template_is_copied_when_runtime_config_is_missing(tmp_path):
     template = tmp_path / "template.yaml"
     template.write_text(
@@ -152,4 +163,15 @@ def test_invalid_ai_configuration_is_rejected(tmp_path, ai_config, message):
     path.write_text(f"ai:\n  {ai_config}\ncrawl: []\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match=message):
+        ConfigStore(path)
+
+
+def test_invalid_exclude_keyword_configuration_is_rejected(tmp_path):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "crawl:\n  - region: 新北市\n    exclude_keywords: [123]\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exclude_keywords"):
         ConfigStore(path)

@@ -157,6 +157,18 @@ def test_region_and_filter_views_cover_enabled_and_unselected_states():
     assert "未勾選時代表全部類型" in empty_kinds_text
 
 
+def test_keywords_view_shows_current_exclusions():
+    text, keyboard = bot._keywords_view(
+        {"crawl": [{"region": "新北市", "exclude_keywords": ["頂樓加蓋", "雅房"]}]},
+        3,
+    )
+
+    assert "目前設定：頂樓加蓋、雅房" in text
+    assert {
+        button.callback_data for row in keyboard.inline_keyboard for button in row
+    } >= {"keywords_edit:3", "keywords_clear:3", "region:3"}
+
+
 @pytest.mark.parametrize(
     ("price_min", "price_max", "expected"),
     [
@@ -905,6 +917,26 @@ async def test_text_input_validates_and_persists_price(bot_harness):
 
 
 @pytest.mark.asyncio
+async def test_text_input_persists_and_clears_exclude_keywords(bot_harness):
+    bot_harness.store.toggle_region(3)
+    bot_harness.context.user_data["awaiting"] = ("keywords", 3)
+    bot_harness.message.text = "頂樓加蓋, pet\n雅房"
+
+    await bot.text_input(bot_harness.update, bot_harness.context)
+
+    assert bot_harness.store.load()["crawl"][0]["exclude_keywords"] == [
+        "頂樓加蓋",
+        "pet",
+        "雅房",
+    ]
+    assert "排除關鍵字已更新" in bot_harness.message.reply_text.await_args.args[0]
+
+    bot_harness.query.data = "keywords_clear:3"
+    await bot.callback(bot_harness.update, bot_harness.context)
+    assert "exclude_keywords" not in bot_harness.store.load()["crawl"][0]
+
+
+@pytest.mark.asyncio
 async def test_enqueue_crawl_is_atomic_and_does_not_queue_a_second_run(monkeypatch):
     started = asyncio.Event()
     release = asyncio.Event()
@@ -1058,7 +1090,19 @@ async def test_run_crawler_wires_ai_evaluation_and_filtering(bot_harness, monkey
 
     async def fake_crawl(config_path, notify, *, evaluate):
         listing = {"id": "abc", "url": "https://rent.591.com.tw/abc"}
-        assert await evaluate("新北市", listing) is False
+        assert (
+            await evaluate(
+                "新北市",
+                listing,
+                {
+                    "sections": ["土城區"],
+                    "kinds": ["整層住家"],
+                    "price_min": 10000,
+                    "price_max": 30000,
+                },
+            )
+            is False
+        )
         assert listing["ai"]["reason"] == "屋況不佳"
         assert listing["images"] == ["https://img.591.com.tw/one.jpg"]
         return {"regions": []}
@@ -1080,7 +1124,7 @@ async def test_run_crawler_logs_ai_evaluation_failure_with_context(
     judge = MagicMock(side_effect=RuntimeError("AI provider unavailable"))
 
     async def fake_crawl(config_path, notify, *, evaluate):
-        assert await evaluate("新北市", {"id": "abc"}) is True
+        assert await evaluate("新北市", {"id": "abc"}, {}) is True
         return {"regions": []}
 
     caplog.set_level(logging.ERROR, logger="rent591_notifier.bot")
@@ -1106,7 +1150,9 @@ async def test_run_crawler_uses_api_key_saved_in_ai_settings(bot_harness, monkey
 
     async def fake_crawl(config_path, notify, *, evaluate):
         assert await evaluate(
-            "新北市", {"id": "abc", "url": "https://rent.591.com.tw/abc"}
+            "新北市",
+            {"id": "abc", "url": "https://rent.591.com.tw/abc"},
+            {},
         )
         return {"regions": []}
 

@@ -46,6 +46,13 @@ def listing(listing_id):
     }
 
 
+def listing_with_title(listing_id, title, **fields):
+    item = listing(listing_id)
+    item["title"] = title
+    item.update(fields)
+    return item
+
+
 @pytest.mark.asyncio
 async def test_page_logs_explain_short_results_and_cross_page_duplicates(
     tmp_path, caplog
@@ -397,7 +404,7 @@ async def test_ai_filtered_listing_is_recorded_without_notification(tmp_path):
     evaluated = []
     notifications = []
 
-    async def evaluate(_, item):
+    async def evaluate(_, item, __):
         evaluated.append(item["id"])
         item["ai"] = {"good": False, "score": 2, "reason": "屋況不佳"}
         return False
@@ -414,7 +421,7 @@ async def test_ai_filtered_listing_is_recorded_without_notification(tmp_path):
         )
 
     assert notifications == []
-    assert evaluated == ["filtered"]
+    assert evaluated == ["filtered", "filtered"]
     assert first["filtered"] == 1
     assert first["regions"] == [
         {
@@ -428,14 +435,16 @@ async def test_ai_filtered_listing_is_recorded_without_notification(tmp_path):
             "filtered": 1,
         }
     ]
-    assert second["filtered"] == 0
-    assert second["skipped"] == 1
+    assert second["filtered"] == 1
+    assert second["skipped"] == 0
     conn = init_db(db_path)
-    assert listing_exists(conn, 3, "filtered")
-    raw = conn.execute(
-        "SELECT raw FROM 'listings_新北市' WHERE id = 'filtered'"
-    ).fetchone()[0]
+    assert not listing_exists(conn, 3, "filtered")
+    status, raw = conn.execute(
+        "SELECT notification_status, raw FROM 'listings_新北市' "
+        "WHERE id = 'filtered'"
+    ).fetchone()
     conn.close()
+    assert status == "filtered"
     assert json.loads(raw)["ai"]["good"] is False
 
 
@@ -445,7 +454,7 @@ async def test_ai_evaluation_failure_fails_open(tmp_path):
     response = payload("新北市", [listing("fallback")])
     notifications = []
 
-    async def evaluate(_, __):
+    async def evaluate(_, __, ___):
         raise RuntimeError("AI unavailable")
 
     async def notify(_, item):
@@ -459,3 +468,100 @@ async def test_ai_evaluation_failure_fails_open(tmp_path):
     assert notifications == ["fallback"]
     assert summary["notified"] == 1
     assert summary["filtered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_keyword_filtered_listing_is_rechecked_and_sent_after_filter_removal(
+    tmp_path,
+):
+    config_path, db_path = write_config(
+        tmp_path,
+        "  - region: 新北市\n    exclude_keywords: [頂樓加蓋, PET]\n",
+    )
+    response = payload(
+        "新北市",
+        [
+            listing_with_title("blocked", "含有頂樓加蓋的房子"),
+            listing_with_title("allowed", "Sunny apartment", tags=["可養寵物"]),
+        ],
+    )
+    evaluated = []
+    notifications = []
+
+    async def evaluate(_, item, __):
+        evaluated.append(item["id"])
+        return True
+
+    async def notify(_, item):
+        notifications.append(item["id"])
+
+    with mock.patch("rent591_notifier.notifier.crawl_rent_list", return_value=response):
+        first = await crawl_and_notify(
+            config_path, notify, run_in_thread=False, evaluate=evaluate
+        )
+        second = await crawl_and_notify(
+            config_path, notify, run_in_thread=False, evaluate=evaluate
+        )
+        config_path.write_text(
+            "database: listings.db\ncrawl:\n  - region: 新北市\n",
+            encoding="utf-8",
+        )
+        third = await crawl_and_notify(
+            config_path, notify, run_in_thread=False, evaluate=evaluate
+        )
+
+    assert notifications == ["allowed", "blocked"]
+    assert evaluated == ["allowed", "blocked"]
+    assert first["filtered"] == 1
+    assert first["notified"] == 1
+    assert second["filtered"] == 1
+    assert second["skipped"] == 1
+    assert third["filtered"] == 0
+    assert third["notified"] == 1
+    assert third["skipped"] == 1
+    conn = init_db(db_path)
+    assert listing_exists(conn, 3, "blocked")
+    assert listing_exists(conn, 3, "allowed")
+    conn.close()
+
+
+@pytest.mark.asyncio
+async def test_keyword_filter_replaces_ambiguous_delivery_with_filtered_state(tmp_path):
+    config_path, db_path = write_config(tmp_path, "  - region: 新北市\n")
+    response = payload("新北市", [listing_with_title("maybe", "頂樓加蓋")])
+    attempts = []
+
+    async def notify(_, item):
+        attempts.append(item["id"])
+        if len(attempts) == 1:
+            raise RuntimeError("uncertain")
+
+    with mock.patch("rent591_notifier.notifier.crawl_rent_list", return_value=response):
+        first = await crawl_and_notify(config_path, notify, run_in_thread=False)
+        config_path.write_text(
+            "database: listings.db\ncrawl:\n"
+            "  - region: 新北市\n    exclude_keywords: [頂樓加蓋]\n",
+            encoding="utf-8",
+        )
+        second = await crawl_and_notify(config_path, notify, run_in_thread=False)
+        conn = init_db(db_path)
+        assert delivery_status(conn, 3, "maybe") is None
+        assert conn.execute(
+            "SELECT notification_status FROM 'listings_新北市' WHERE id = 'maybe'"
+        ).fetchone() == ("filtered",)
+        conn.close()
+        config_path.write_text(
+            "database: listings.db\ncrawl:\n  - region: 新北市\n",
+            encoding="utf-8",
+        )
+        third = await crawl_and_notify(config_path, notify, run_in_thread=False)
+
+    assert first["ambiguous"] == 1
+    assert second["filtered"] == 1
+    assert second["notified"] == 0
+    assert third["notified"] == 1
+    assert attempts == ["maybe", "maybe"]
+    conn = init_db(db_path)
+    assert delivery_status(conn, 3, "maybe") == "sent"
+    assert listing_exists(conn, 3, "maybe")
+    conn.close()

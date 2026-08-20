@@ -34,6 +34,7 @@ from .crawler import (
     _resolve_sections,
     _validate_price_range,
 )
+from .keyword_filter import normalize_keywords
 
 LOGGER = logging.getLogger(__name__)
 
@@ -237,6 +238,10 @@ class ConfigStore:
             job.setdefault("sections", [])
             job.setdefault("kinds", [])
             job.setdefault("price", {})
+            if "exclude_keywords" in job:
+                job["exclude_keywords"] = normalize_keywords(
+                    job["exclude_keywords"], f"crawl[{index}].exclude_keywords"
+                )
             if not isinstance(job["sections"], list):
                 raise ValueError(f"crawl[{index}].sections must be a list")
             if not isinstance(job["kinds"], list):
@@ -435,6 +440,21 @@ class ConfigStore:
             if price_max is not None:
                 price["max"] = price_max
             job["price"] = price
+
+        return self.update(mutate)
+
+    def set_exclude_keywords(
+        self, region: int | str, keywords: list[str] | None
+    ) -> dict[str, Any]:
+        region_id = _resolve_region(region)
+        normalized = normalize_keywords(keywords)
+
+        def mutate(data: dict[str, Any]) -> None:
+            job = self._ensure_job(data, region_id)
+            if normalized:
+                job["exclude_keywords"] = normalized
+            else:
+                job.pop("exclude_keywords", None)
 
         return self.update(mutate)
 

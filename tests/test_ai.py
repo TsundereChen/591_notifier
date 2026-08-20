@@ -74,6 +74,12 @@ def test_evaluate_listing_sends_full_detail_and_images_go(monkeypatch):
         "新北市",
         listing(),
         api_key="test-key",
+        crawl_filters={
+            "sections": ["土城區"],
+            "kinds": ["整層住家"],
+            "price_min": 10000,
+            "price_max": 30000,
+        },
         detail_fetcher=lambda *_args, **_kwargs: detail_payload(),
     )
 
@@ -87,6 +93,9 @@ def test_evaluate_listing_sends_full_detail_and_images_go(monkeypatch):
     assert post.call_args.args[0] == "https://opencode.ai/zen/go/v1/chat/completions"
     user_content = request["messages"][1]["content"]
     prompt = user_content[0]["text"]
+    assert "行政區：土城區" in prompt
+    assert "物件類型：整層住家" in prompt
+    assert "租金範圍：NT$10,000～30,000" in prompt
     assert "完整地址：新北市土城區中央路100號" in prompt
     assert "租住說明：養寵物：不可" in prompt
     assert "提供設備：冷氣、洗衣機" in prompt

@@ -53,6 +53,7 @@ from .database import (
     resolve_ambiguous_delivery,
     resolve_database_path,
 )
+from .keyword_filter import normalize_keywords
 from .notifier import crawl_and_notify
 
 LOGGER = logging.getLogger(__name__)
@@ -204,7 +205,7 @@ def _home_view(data):
     text = (
         "591 租屋通知機器人\n\n"
         f"{_config_summary(data)}\n\n"
-        "只有成功傳送通知的物件才會寫入資料庫。每次執行時，"
+        "成功傳送或被篩選的物件會寫入資料庫。每次執行時，"
         "每個縣市最多檢查 5 頁、150 筆結果。"
     )
     keyboard = InlineKeyboardMarkup(
@@ -252,17 +253,21 @@ def _region_view(data, region_id):
     sections = job.get("sections") or []
     kinds = job.get("kinds") or []
     price = job.get("price") or {}
+    exclude_keywords = job.get("exclude_keywords") or []
     section_text = "、".join(map(str, sections)) if sections else "全部"
     kind_text = "、".join(map(str, kinds)) if kinds else "全部"
     price_text = _format_price(price.get("min"), price.get("max"))
+    keyword_text = "、".join(map(str, exclude_keywords)) if exclude_keywords else "無"
     text = (
         f"{name}\n\n狀態：已啟用\n行政區：{section_text}\n"
-        f"物件類型：{kind_text}\n租金：{price_text}"
+        f"物件類型：{kind_text}\n租金：{price_text}\n"
+        f"排除關鍵字：{keyword_text}"
     )
     buttons = [
         [InlineKeyboardButton("📍 行政區", callback_data=f"sections:{region_id}")],
         [InlineKeyboardButton("🏠 物件類型", callback_data=f"kinds:{region_id}")],
         [InlineKeyboardButton("💰 租金範圍", callback_data=f"price:{region_id}")],
+        [InlineKeyboardButton("🚫 排除關鍵字", callback_data=f"keywords:{region_id}")],
         [InlineKeyboardButton("停用", callback_data=f"region_toggle:{region_id}")],
         [InlineKeyboardButton("⬅️ 縣市列表", callback_data="regions")],
     ]
@@ -331,6 +336,36 @@ def _kinds_view(data, region_id):
         "未勾選時代表全部類型。" if not selected else f"已選擇 {len(selected)} 種類型。"
     )
     return f"{REGIONS[region_id]}物件類型\n\n{note}", InlineKeyboardMarkup(rows)
+
+
+def _keywords_view(data, region_id):
+    job = _job_for_region(data, region_id) or {}
+    keywords = job.get("exclude_keywords") or []
+    keyword_text = "、".join(map(str, keywords)) if keywords else "未設定"
+    text = (
+        f"{REGIONS[region_id]}排除關鍵字\n\n"
+        f"目前設定：{keyword_text}\n"
+        "物件標題、標籤與列表基本資訊只要命中任一關鍵字，就不會通知。"
+    )
+    rows = [
+        [
+            InlineKeyboardButton(
+                "✏️ 編輯關鍵字", callback_data=f"keywords_edit:{region_id}"
+            )
+        ],
+    ]
+    if keywords:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "清除關鍵字", callback_data=f"keywords_clear:{region_id}"
+                )
+            ]
+        )
+    rows.append(
+        [InlineKeyboardButton("⬅️ 縣市設定", callback_data=f"region:{region_id}")]
+    )
+    return text, InlineKeyboardMarkup(rows)
 
 
 def _ai_view(data):
@@ -535,6 +570,7 @@ def _config_summary(data):
                 f"    行政區：{'、'.join(map(str, job.get('sections') or [])) or '全部'}",
                 f"    物件類型：{'、'.join(map(str, job.get('kinds') or [])) or '全部'}",
                 f"    租金範圍：{_format_price(price.get('min'), price.get('max'))}",
+                f"    排除關鍵字：{'、'.join(map(str, job.get('exclude_keywords') or [])) or '無'}",
             ]
         )
     return "\n".join(lines)
@@ -773,7 +809,7 @@ async def _run_crawler(application, status_chat_id=None):
         if api_key is not None or provider == PROVIDER_ZEN:
             filter_rejected = ai_config.get("filter", True)
 
-            async def evaluate(region, listing):
+            async def evaluate(region, listing, crawl_filters=None):
                 try:
                     verdict, images = await asyncio.to_thread(
                         evaluate_listing,
@@ -781,6 +817,7 @@ async def _run_crawler(application, status_chat_id=None):
                         region,
                         listing,
                         api_key=api_key,
+                        crawl_filters=crawl_filters,
                     )
                 except Exception:
                     LOGGER.exception(
@@ -975,6 +1012,20 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         region_id = int(action.split(":")[1])
         store.clear_kinds(region_id)
         view = _kinds_view(store.load(), region_id)
+    elif action.startswith("keywords:"):
+        view = _keywords_view(store.load(), int(action.split(":")[1]))
+    elif action.startswith("keywords_edit:"):
+        region_id = int(action.split(":")[1])
+        context.user_data["awaiting"] = ("keywords", region_id)
+        await query.message.reply_text(
+            "請輸入要排除的關鍵字，以逗號或換行分隔；任一關鍵字命中物件列表資訊就不會通知。"
+            "輸入 - 清除全部關鍵字。"
+        )
+        return
+    elif action.startswith("keywords_clear:"):
+        region_id = int(action.split(":")[1])
+        store.set_exclude_keywords(region_id, None)
+        view = _keywords_view(store.load(), region_id)
     elif action.startswith("price:"):
         view = _price_view(store.load(), int(action.split(":")[1]))
     elif action.startswith("price_set:"):
@@ -1140,6 +1191,30 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update.effective_message.reply_text(
             "AI API 金鑰已更新。請使用 /ai 繼續設定。"
+        )
+        return
+
+    if kind == "keywords":
+        try:
+            if value == "-":
+                keywords = None
+            else:
+                keywords = normalize_keywords(
+                    [
+                        part.strip()
+                        for part in re.split(r"[,，、;；\n]+", value)
+                        if part.strip()
+                    ]
+                )
+                if not keywords:
+                    raise ValueError("請至少輸入一個關鍵字，或輸入 - 清除。")
+            store.set_exclude_keywords(region_id, keywords)
+        except ValueError as exc:
+            context.user_data["awaiting"] = awaiting
+            await update.effective_message.reply_text(str(exc))
+            return
+        await update.effective_message.reply_text(
+            "排除關鍵字已更新。請使用 /menu 繼續設定。"
         )
         return
 

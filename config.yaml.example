@@ -4,6 +4,8 @@
 # crawl：   要爬取的縣市清單。每一筆都必須包含 region（縣市）；
 #           sections（鄉鎮市區）可省略，省略時代表整個縣市；
 #           kinds 與 price 也可省略，省略時代表不限類型／租金。
+#           exclude_keywords 可填寫要排除的關鍵字；不分大小寫，命中時標記為已篩選，
+#           後續執行會重新比對，移除排除條件後可恢復通知。
 # 機器人固定檢查前 5 頁，且每次執行時每個縣市最多處理 150 筆結果。
 
 database: listings.db
@@ -36,7 +38,9 @@ crawl:
       - 中和區
     kinds: []  # 例如：[整層住家, 獨立套房]；空陣列代表不限類型。
     price: {}  # 例如：{min: 10000, max: 30000}；空物件代表不限租金。
+    exclude_keywords: [] # 例如：[頂樓加蓋, 雅房]；命中任一關鍵字就不通知。
   - region: 台北市
     sections: []
     kinds: []
     price: {}
+    exclude_keywords: []

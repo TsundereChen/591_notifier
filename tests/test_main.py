@@ -12,6 +12,7 @@ from rent591_notifier.database import (
     listing_exists,
     load_config,
     mark_delivery_ambiguous,
+    record_filtered_listing,
     reserve_delivery,
     resolve_ambiguous_delivery,
     retryable_deliveries,
@@ -61,6 +62,21 @@ crawl:
                 },
             ],
         }
+
+    def test_loads_exclude_keywords(self, tmp_path):
+        cfg = load_config(
+            write_config(
+                tmp_path,
+                """
+database: rent.db
+crawl:
+  - region: 新北市
+    exclude_keywords: [頂樓加蓋, 雅房]
+""",
+            )
+        )
+
+        assert cfg["jobs"][0]["exclude_keywords"] == ["頂樓加蓋", "雅房"]
 
     @pytest.mark.parametrize(
         "text, message",
@@ -127,6 +143,53 @@ class TestDatabase:
             "updated_at": "before",
         }
         conn.close()
+
+    def test_init_expands_existing_listing_status_constraint(self, tmp_path):
+        db_path = tmp_path / "v3.db"
+        old = sqlite3.connect(db_path)
+        old.execute(
+            'CREATE TABLE "listings_新北市" ('
+            "id TEXT PRIMARY KEY, first_seen TEXT NOT NULL, last_seen TEXT NOT NULL, "
+            "notification_status TEXT NOT NULL DEFAULT 'sent' "
+            "CHECK (notification_status IN ('sent', 'unknown')))"
+        )
+        old.execute(
+            'INSERT INTO "listings_新北市" '
+            "(id, first_seen, last_seen) VALUES "
+            "('123', 'before', 'before'), ('old-filter', 'before', 'before')"
+        )
+        old.execute(
+            "CREATE TABLE delivery_attempts ("
+            "region_id INTEGER NOT NULL, listing_id TEXT NOT NULL, status TEXT NOT NULL, "
+            "started_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+            "telegram_chat_id INTEGER, telegram_message_id INTEGER, payload TEXT, "
+            "attempt_count INTEGER NOT NULL DEFAULT 0, last_error TEXT, "
+            "PRIMARY KEY (region_id, listing_id))"
+        )
+        old.execute(
+            "INSERT INTO delivery_attempts "
+            "(region_id, listing_id, status, started_at, updated_at, payload, "
+            "attempt_count) VALUES (3, 'old-filter', 'sent', 'before', 'before', "
+            '\'{"id": "old-filter"}\', 0)'
+        )
+        old.execute("PRAGMA user_version = 3")
+        old.commit()
+        old.close()
+
+        conn = init_db(db_path, [3])
+        assert record_filtered_listing(
+            conn, 3, {"id": "filtered", "title": "Filtered"}, "now"
+        )
+        rows = conn.execute(
+            'SELECT id, notification_status FROM "listings_新北市" ORDER BY id'
+        ).fetchall()
+        conn.close()
+
+        assert rows == [
+            ("123", "sent"),
+            ("filtered", "filtered"),
+            ("old-filter", "filtered"),
+        ]
 
     def test_init_migrates_combined_table_into_region_table(self, tmp_path):
         db_path = tmp_path / "old.db"
@@ -195,6 +258,27 @@ class TestDatabase:
             "2026-01-02T00:00:00",
         )
 
+    def test_filtered_listing_is_not_considered_delivered(self):
+        conn = init_db(":memory:", [3])
+        listing = {"id": "123", "title": "Filtered"}
+
+        assert record_filtered_listing(conn, 3, listing, "first")
+        assert not record_filtered_listing(conn, 3, listing, "second")
+        assert not listing_exists(conn, 3, "123")
+        assert conn.execute(
+            'SELECT notification_status, last_seen FROM "listings_新北市" '
+            "WHERE id = '123'"
+        ).fetchone() == ("filtered", "second")
+        reservation = reserve_delivery(conn, 3, "123", "third")
+        assert reservation.status == "reserved"
+        assert insert_notified_listing(
+            conn, listing, 3, "fourth", attempt_count=reservation.attempt_count
+        )
+        assert not record_filtered_listing(conn, 3, listing, "stale-filter")
+        assert listing_exists(conn, 3, "123")
+        assert delivery_status(conn, 3, "123") == "sent"
+        conn.close()
+
     def test_interrupted_delivery_is_reserved_again_for_automatic_retry(self):
         conn = init_db(":memory:", [3])
         first = reserve_delivery(
@@ -231,6 +315,25 @@ class TestDatabase:
         )
         assert reserve_delivery(conn, 3, "123", "fourth").status == "sent"
         assert ambiguous_deliveries(conn) == []
+        conn.close()
+
+    def test_filtered_write_cannot_replace_owner_reconciliation(self):
+        conn = init_db(":memory:", [3])
+        listing = {"id": "123", "title": "Filtered after reconciliation"}
+        reservation = reserve_delivery(conn, 3, "123", "first", listing=listing)
+        assert mark_delivery_ambiguous(
+            conn,
+            3,
+            "123",
+            "second",
+            attempt_count=reservation.attempt_count,
+            error="timeout",
+        )
+        assert resolve_ambiguous_delivery(conn, 3, "123", delivered=True, now="third")
+
+        assert not record_filtered_listing(conn, 3, listing, "stale-filter")
+        assert delivery_status(conn, 3, "123") == "sent"
+        assert reserve_delivery(conn, 3, "123", "fourth").status == "sent"
         conn.close()
 
     def test_retry_decision_keeps_ambiguous_attempt_queued(self):
