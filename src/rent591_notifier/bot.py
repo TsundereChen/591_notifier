@@ -680,23 +680,6 @@ async def _send_listing(bot, chat_id, text, images, *, listing_id="unknown"):
     )
 
 
-def _format_crawl_summary(summary):
-    """Format the per-county result report sent after each crawl."""
-    lines = ["爬蟲執行完成："]
-    for region in summary.get("regions", []):
-        processed = region.get("processed", region["crawled"])
-        retried = region.get("retried", 0)
-        filtered = region.get("filtered", 0)
-        filtered_text = f"、AI 過濾 {filtered} 筆" if filtered else ""
-        lines.append(
-            f"{region['region']}：總處理 {processed} 筆"
-            f"（本次爬取 {region['crawled']} 筆、其中重試 {retried} 筆）、"
-            f"已匹配 {region['matched']} 筆、新推送 {region['pushed']} 筆"
-            f"{filtered_text}、推送失敗 {region.get('failed', 0)} 筆"
-        )
-    return "\n".join(lines)
-
-
 def _pending_rows(store):
     data = store.load()
     db_path = resolve_database_path(store.path, data["database"])
@@ -873,14 +856,6 @@ async def _run_crawler(application, status_chat_id=None):
         except Exception:
             LOGGER.exception("Could not send crawl failure report to Telegram")
         return None
-    report_chat_id = status_chat_id or chat_id
-    if report_chat_id:
-        try:
-            await application.bot.send_message(
-                report_chat_id, _format_crawl_summary(summary)
-            )
-        except Exception:
-            LOGGER.exception("Could not send crawl completion report to Telegram")
     LOGGER.info(
         "Crawl execution succeeded trigger=%s fetched=%s notified=%s failed=%s",
         "manual" if status_chat_id else "scheduled",
