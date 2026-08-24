@@ -613,13 +613,18 @@ def _listing_message(region, listing):
         lines.append(f"🏢 {details}")
     verdict = listing.get("ai")
     if isinstance(verdict, dict):
-        good = bool(verdict.get("good"))
-        score = verdict.get("score")
-        score_text = f"（{score}/10）" if isinstance(score, int) else ""
-        lines.append(f"🤖 AI 評估：{'✅ 推薦' if good else '⚠️ 不推薦'}{score_text}")
-        reason = str(verdict.get("reason") or "").strip()
-        if reason:
-            lines.append(f"💭 {reason}")
+        if verdict.get("unavailable"):
+            lines.append("🤖 AI 評估：⚠️ 暫時無法評估")
+        else:
+            good = bool(verdict.get("good"))
+            score = verdict.get("score")
+            score_text = f"（{score}/10）" if isinstance(score, int) else ""
+            lines.append(
+                f"🤖 AI 評估：{'✅ 推薦' if good else '⚠️ 不推薦'}{score_text}"
+            )
+            reason = str(verdict.get("reason") or "").strip()
+            if reason:
+                lines.append(f"💭 {reason}")
     if listing.get("url"):
         lines.extend(["", listing["url"]])
     return "\n".join(lines)
@@ -804,6 +809,7 @@ async def _run_crawler(application, status_chat_id=None):
             async def evaluate(region, listing, crawl_filters=None):
                 nonlocal models_exhausted
                 if models_exhausted:
+                    listing["ai"] = {"unavailable": True}
                     return True
                 for model in models:
                     if model_failures[model] >= MAX_MODEL_FAILURES_PER_CRAWL:
@@ -840,7 +846,11 @@ async def _run_crawler(application, status_chat_id=None):
                             model,
                             extra={"sensitive_values": (ai_config.get("api_key"),)},
                         )
+                        listing["ai"] = {"unavailable": True}
                         return True
+                    # A success clears this model's failure count so a few isolated
+                    # hiccups earlier in a long crawl don't permanently disable it.
+                    model_failures[model] = 0
                     listing["ai"] = verdict
                     if images:
                         listing["images"] = images
@@ -854,6 +864,7 @@ async def _run_crawler(application, status_chat_id=None):
                         "All AI models reached the per-crawl failure limit; "
                         "continuing without AI"
                     )
+                listing["ai"] = {"unavailable": True}
                 return True
 
     async def notify(region, listing):

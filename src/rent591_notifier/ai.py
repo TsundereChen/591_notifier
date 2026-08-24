@@ -28,7 +28,7 @@ MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_DESCRIPTION_CHARS = 2000
 MAX_CRITERIA_CHARS = 2000
 MAX_REASON_CHARS = 200
-REQUEST_TIMEOUT = 120
+REQUEST_TIMEOUT = 300
 ALLOWED_IMAGE_HOST_SUFFIX = ".591.com.tw"
 
 DEFAULT_CRITERIA = (
@@ -377,19 +377,37 @@ def evaluate_listing(
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ]
-        try:
-            content = _chat_completion(
-                api_key, api_endpoint, model, messages, json_mode=json_mode
-            )
-        except _BadRequestError as exc:
-            last_error = exc
-            LOGGER.warning(
-                "AI provider rejected request; retrying with reduced options "
-                "listing_id=%s json_mode=%s images=%s",
-                listing.get("id", "unknown"),
-                json_mode,
-                with_images,
-            )
+        content = None
+        for retry in range(2):
+            try:
+                content = _chat_completion(
+                    api_key, api_endpoint, model, messages, json_mode=json_mode
+                )
+                break
+            except _BadRequestError as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "AI provider rejected request; retrying with reduced options "
+                    "listing_id=%s json_mode=%s images=%s",
+                    listing.get("id", "unknown"),
+                    json_mode,
+                    with_images,
+                )
+                break
+            except AIModelError as exc:
+                last_error = exc
+                if retry == 0:
+                    # Transient errors (timeouts, dropped connections) are worth one
+                    # immediate retry: a local model may just have been cold-loading.
+                    LOGGER.warning(
+                        "AI request failed; retrying once listing_id=%s "
+                        "json_mode=%s images=%s error=%s",
+                        listing.get("id", "unknown"),
+                        json_mode,
+                        with_images,
+                        exc,
+                    )
+        if content is None:
             continue
         verdict = _parse_verdict(content)
         LOGGER.info(
