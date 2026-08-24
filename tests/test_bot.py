@@ -1155,12 +1155,12 @@ async def test_run_crawler_disables_model_after_five_failures(bot_harness, monke
     bot_harness.store.set_ai_api_key("test-key")
     success = ({"good": True, "score": 8, "reason": "推薦"}, [])
     judge = MagicMock(
-        side_effect=[bot.AIModelError("unavailable")] * 5 + [success, success]
+        side_effect=([bot.AIModelError("unavailable"), success] * 5) + [success]
     )
 
     async def fake_crawl(config_path, notify, *, evaluate):
-        assert await evaluate("新北市", {"id": "first"}, {}) is True
-        assert await evaluate("新北市", {"id": "second"}, {}) is True
+        for index in range(6):
+            assert await evaluate("新北市", {"id": str(index)}, {}) is True
         return {"regions": []}
 
     monkeypatch.setattr(bot, "evaluate_listing", judge)
@@ -1169,9 +1169,13 @@ async def test_run_crawler_disables_model_after_five_failures(bot_harness, monke
     assert await bot._run_crawler(bot_harness.application) == {"regions": []}
     assert [call.kwargs["model"] for call in judge.call_args_list] == [
         "primary-model",
+        "backup-model",
         "primary-model",
+        "backup-model",
         "primary-model",
+        "backup-model",
         "primary-model",
+        "backup-model",
         "primary-model",
         "backup-model",
         "backup-model",
@@ -1188,9 +1192,11 @@ async def test_run_crawler_skips_ai_after_all_models_fail(bot_harness, monkeypat
     judge = MagicMock(side_effect=bot.AIModelError("unavailable"))
 
     async def fake_crawl(config_path, notify, *, evaluate):
-        assert await evaluate("新北市", {"id": "first"}, {}) is True
+        for index in range(5):
+            assert await evaluate("新北市", {"id": str(index)}, {}) is True
+            assert judge.call_count == (index + 1) * 2
         assert judge.call_count == 10
-        assert await evaluate("新北市", {"id": "second"}, {}) is True
+        assert await evaluate("新北市", {"id": "after-exhaustion"}, {}) is True
         assert judge.call_count == 10
         return {"regions": []}
 

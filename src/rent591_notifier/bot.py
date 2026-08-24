@@ -806,49 +806,54 @@ async def _run_crawler(application, status_chat_id=None):
                 if models_exhausted:
                     return True
                 for model in models:
-                    while model_failures[model] < MAX_MODEL_FAILURES_PER_CRAWL:
-                        try:
-                            verdict, images = await asyncio.to_thread(
-                                evaluate_listing,
-                                ai_config,
-                                region,
-                                listing,
-                                model=model,
-                                crawl_filters=crawl_filters,
-                            )
-                        except AIModelError:
-                            model_failures[model] += 1
-                            LOGGER.warning(
-                                "AI model evaluation failed; retrying if available "
-                                "region=%s listing_id=%s model=%s failures=%s/%s",
-                                region,
-                                listing.get("id", "unknown"),
-                                model,
-                                model_failures[model],
-                                MAX_MODEL_FAILURES_PER_CRAWL,
-                                exc_info=True,
-                                extra={"sensitive_values": (ai_config.get("api_key"),)},
-                            )
-                            continue
-                        except Exception:
-                            LOGGER.exception(
-                                "AI evaluation failed; delivering listing without AI verdict "
-                                "region=%s listing_id=%s model=%s",
-                                region,
-                                listing.get("id", "unknown"),
-                                model,
-                                extra={"sensitive_values": (ai_config.get("api_key"),)},
-                            )
-                            return True
-                        listing["ai"] = verdict
-                        if images:
-                            listing["images"] = images
-                        return bool(verdict["good"]) or not filter_rejected
-                models_exhausted = True
-                LOGGER.error(
-                    "All AI models reached the per-crawl failure limit; "
-                    "continuing without AI"
+                    if model_failures[model] >= MAX_MODEL_FAILURES_PER_CRAWL:
+                        continue
+                    try:
+                        verdict, images = await asyncio.to_thread(
+                            evaluate_listing,
+                            ai_config,
+                            region,
+                            listing,
+                            model=model,
+                            crawl_filters=crawl_filters,
+                        )
+                    except AIModelError:
+                        model_failures[model] += 1
+                        LOGGER.warning(
+                            "AI model evaluation failed; trying next model if available "
+                            "region=%s listing_id=%s model=%s failures=%s/%s",
+                            region,
+                            listing.get("id", "unknown"),
+                            model,
+                            model_failures[model],
+                            MAX_MODEL_FAILURES_PER_CRAWL,
+                            exc_info=True,
+                            extra={"sensitive_values": (ai_config.get("api_key"),)},
+                        )
+                        continue
+                    except Exception:
+                        LOGGER.exception(
+                            "AI evaluation failed; delivering listing without AI verdict "
+                            "region=%s listing_id=%s model=%s",
+                            region,
+                            listing.get("id", "unknown"),
+                            model,
+                            extra={"sensitive_values": (ai_config.get("api_key"),)},
+                        )
+                        return True
+                    listing["ai"] = verdict
+                    if images:
+                        listing["images"] = images
+                    return bool(verdict["good"]) or not filter_rejected
+                models_exhausted = all(
+                    failures >= MAX_MODEL_FAILURES_PER_CRAWL
+                    for failures in model_failures.values()
                 )
+                if models_exhausted:
+                    LOGGER.error(
+                        "All AI models reached the per-crawl failure limit; "
+                        "continuing without AI"
+                    )
                 return True
 
     async def notify(region, listing):
