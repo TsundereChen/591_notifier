@@ -13,17 +13,14 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
 from .ai import (
     DEFAULT_MAX_IMAGES,
-    DEFAULT_MODEL,
     MAX_CRITERIA_CHARS,
     MAX_IMAGES_LIMIT,
-    PROVIDER_CHOICES,
-    PROVIDER_GO,
-    PROVIDER_ZEN,
 )
 from .crawler import (
     KINDS,
@@ -46,16 +43,53 @@ DEFAULT_CONFIG = {
     "ai": {
         "enabled": False,
         "filter": True,
-        "provider": PROVIDER_GO,
-        "model": DEFAULT_MODEL,
+        "api_endpoint": None,
+        "api_key": None,
+        "models": [],
         "criteria": None,
         "max_images": DEFAULT_MAX_IMAGES,
-        "api_key": None,
     },
     "crawl": [],
 }
 
-MODEL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+MODEL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]*")
+
+
+def _normalize_ai_endpoint(api_endpoint: str | None) -> str | None:
+    if api_endpoint is None:
+        return None
+    if not isinstance(api_endpoint, str) or not api_endpoint.strip():
+        raise ValueError("api_endpoint must be a non-empty URL or None")
+    api_endpoint = api_endpoint.strip().rstrip("/")
+    parsed_endpoint = urlparse(api_endpoint)
+    if (
+        parsed_endpoint.scheme not in {"http", "https"}
+        or not parsed_endpoint.netloc
+        or parsed_endpoint.username is not None
+        or parsed_endpoint.password is not None
+        or parsed_endpoint.params
+        or parsed_endpoint.query
+        or parsed_endpoint.fragment
+        or any(character.isspace() for character in api_endpoint)
+    ):
+        raise ValueError(
+            "api_endpoint must be a valid HTTP(S) URL without credentials, query, or fragment"
+        )
+    return api_endpoint
+
+
+def _normalize_ai_models(models: Any) -> list[str]:
+    if not isinstance(models, list):
+        raise ValueError("models must be a list")
+    normalized = []
+    for model in models:
+        if not isinstance(model, str) or not MODEL_ID_PATTERN.fullmatch(model.strip()):
+            raise ValueError("models must contain valid model ids")
+        model = model.strip()
+        if model in normalized:
+            raise ValueError("models must not contain duplicates")
+        normalized.append(model)
+    return normalized
 
 
 class InstanceLock:
@@ -171,35 +205,51 @@ class ConfigStore:
         ai = result.get("ai")
         if not isinstance(ai, dict):
             raise ValueError("'ai' must be a mapping")
+        # Convert configurations written before provider selection was removed.
+        legacy_provider = ai.pop("provider", None)
+        if legacy_provider is not None and legacy_provider not in {"go", "zen"}:
+            raise ValueError("'ai.provider' is no longer supported")
+        if "api_endpoint" not in ai and legacy_provider in {"go", "zen"}:
+            ai["api_endpoint"] = (
+                "https://opencode.ai/zen/go/v1"
+                if legacy_provider == "go"
+                else "https://opencode.ai/zen/v1"
+            )
+        legacy_model = ai.pop("model", None)
+        if legacy_model is not None and "models" in ai:
+            raise ValueError("'ai.model' and 'ai.models' cannot both be set")
+        if "models" not in ai and legacy_model is not None:
+            ai["models"] = [legacy_model]
         unknown_ai_keys = set(ai) - {
             "enabled",
             "filter",
-            "provider",
-            "model",
+            "api_endpoint",
+            "api_key",
+            "models",
             "criteria",
             "max_images",
-            "api_key",
         }
         if unknown_ai_keys:
             raise ValueError(f"'ai' has unknown keys: {sorted(unknown_ai_keys)}")
         ai.setdefault("enabled", False)
         ai.setdefault("filter", True)
-        ai.setdefault("provider", PROVIDER_GO)
-        ai.setdefault("model", DEFAULT_MODEL)
+        ai.setdefault("api_endpoint", None)
+        ai.setdefault("api_key", None)
+        ai.setdefault("models", [])
         ai.setdefault("criteria", None)
         ai.setdefault("max_images", DEFAULT_MAX_IMAGES)
-        ai.setdefault("api_key", None)
         if not isinstance(ai["enabled"], bool):
             raise ValueError("'ai.enabled' must be a boolean")
         if not isinstance(ai["filter"], bool):
             raise ValueError("'ai.filter' must be a boolean")
-        provider = ai.get("provider")
-        if provider not in PROVIDER_CHOICES:
-            raise ValueError(f"'ai.provider' must be one of {PROVIDER_CHOICES}")
-        if not isinstance(ai["model"], str) or not MODEL_ID_PATTERN.fullmatch(
-            ai["model"]
-        ):
-            raise ValueError("'ai.model' must be a valid model id")
+        try:
+            ai["api_endpoint"] = _normalize_ai_endpoint(ai["api_endpoint"])
+        except ValueError as exc:
+            raise ValueError(f"'ai.api_endpoint' is invalid: {exc}") from exc
+        try:
+            ai["models"] = _normalize_ai_models(ai["models"])
+        except ValueError as exc:
+            raise ValueError(f"'ai.models' is invalid: {exc}") from exc
         if ai["criteria"] is not None and (
             not isinstance(ai["criteria"], str) or not ai["criteria"].strip()
         ):
@@ -471,10 +521,9 @@ class ConfigStore:
     def set_ai_filter(self, enabled: bool):
         return self.update(lambda data: data["ai"].__setitem__("filter", bool(enabled)))
 
-    def set_ai_model(self, model: str):
-        if not isinstance(model, str) or not MODEL_ID_PATTERN.fullmatch(model.strip()):
-            raise ValueError("model must be a valid model id")
-        return self.update(lambda data: data["ai"].__setitem__("model", model.strip()))
+    def set_ai_models(self, models: list[str]):
+        models = _normalize_ai_models(models)
+        return self.update(lambda data: data["ai"].__setitem__("models", models))
 
     def set_ai_criteria(self, criteria: str | None):
         if criteria is not None and (
@@ -491,10 +540,11 @@ class ConfigStore:
             )
         )
 
-    def set_ai_provider(self, provider: str):
-        if provider not in PROVIDER_CHOICES:
-            raise ValueError(f"provider must be one of {PROVIDER_CHOICES}")
-        return self.update(lambda data: data["ai"].__setitem__("provider", provider))
+    def set_ai_api_endpoint(self, api_endpoint: str | None):
+        api_endpoint = _normalize_ai_endpoint(api_endpoint)
+        return self.update(
+            lambda data: data["ai"].__setitem__("api_endpoint", api_endpoint)
+        )
 
     def set_ai_api_key(self, api_key: str | None):
         if api_key is not None and (

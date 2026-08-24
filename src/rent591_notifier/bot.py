@@ -28,16 +28,7 @@ from telegram.ext import (
     filters,
 )
 
-from .ai import (
-    API_KEY_ENV,
-    DEFAULT_MODEL,
-    GO_API_KEY_ENV,
-    PROVIDER_CHOICES,
-    PROVIDER_GO,
-    PROVIDER_ZEN,
-    api_key_from_env,
-    evaluate_listing,
-)
+from .ai import AIModelError, evaluate_listing
 from .config_store import ConfigStore
 from .crawler import (
     KINDS,
@@ -58,6 +49,7 @@ from .notifier import crawl_and_notify
 
 LOGGER = logging.getLogger(__name__)
 CRAWL_JOB_NAME = "scheduled-crawl"
+MAX_MODEL_FAILURES_PER_CRAWL = 5
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 REDACTED = "[REDACTED]"
 TELEGRAM_BOT_TOKEN_PATTERN = re.compile(
@@ -372,28 +364,31 @@ def _ai_view(data):
     ai = data.get("ai") or {}
     enabled = bool(ai.get("enabled"))
     filter_mode = bool(ai.get("filter", True))
-    provider = ai.get("provider") or PROVIDER_GO
-    model = ai.get("model") or DEFAULT_MODEL
+    api_endpoint = ai.get("api_endpoint") or "未設定"
+    models = ai.get("models") or []
+    models_text = "、".join(models) or "未設定"
     criteria = (ai.get("criteria") or "").strip() or "（使用預設標準）"
-    provider_label = "OpenCode Go" if provider == PROVIDER_GO else "OpenCode Zen"
-    api_key_configured = bool(ai.get("api_key") or api_key_from_env(provider))
-    # Determine which API key to check based on provider.
-    if provider == PROVIDER_GO:
-        key_status = (
-            "已設定" if api_key_configured else "未設定（環境變數 OPENCODE_GO_API_KEY）"
+    key_status = "已設定" if ai.get("api_key") else "未設定"
+    missing = [
+        label
+        for label, value in (
+            ("API 端點", ai.get("api_endpoint")),
+            ("API 金鑰", ai.get("api_key")),
+            ("模型", models),
         )
-    else:
-        key_status = (
-            "已設定"
-            if api_key_configured
-            else "未設定（環境變數 OPENCODE_ZEN_API_KEY，免費模型可選）"
-        )
+        if not value
+    ]
+    status = (
+        f"啟用（設定不完整：{'、'.join(missing)}）"
+        if enabled and missing
+        else "啟用" if enabled else "停用"
+    )
     text = (
         "AI 物件評估\n\n"
-        f"狀態：{'啟用' if enabled else '停用'}\n"
+        f"狀態：{status}\n"
         f"模式：{'過濾不推薦的物件' if filter_mode else '僅在通知中標註評語'}\n"
-        f"提供者：{provider_label}\n"
-        f"模型：{model}\n"
+        f"API 端點：{api_endpoint}\n"
+        f"模型：{models_text}\n"
         f"API 金鑰：{key_status}\n"
         f"評估標準：{criteria}"
     )
@@ -405,13 +400,9 @@ def _ai_view(data):
             )
         ],
         [InlineKeyboardButton("切換模式（過濾／標註）", callback_data="ai_mode")],
-        [
-            InlineKeyboardButton(
-                f"提供者：{provider_label}", callback_data="ai_provider"
-            )
-        ],
+        [InlineKeyboardButton("✏️ API 端點", callback_data="ai_api_endpoint")],
         [InlineKeyboardButton("✏️ 評估標準", callback_data="ai_criteria")],
-        [InlineKeyboardButton("✏️ 模型", callback_data="ai_model")],
+        [InlineKeyboardButton("✏️ 模型清單", callback_data="ai_models")],
         [InlineKeyboardButton("✏️ API 金鑰", callback_data="ai_api_key")],
         [InlineKeyboardButton("⬅️ 主選單", callback_data="home")],
     ]
@@ -543,11 +534,8 @@ def _config_summary(data):
     ai = data.get("ai") or {}
     if ai.get("enabled"):
         mode = "過濾模式" if ai.get("filter", True) else "標註模式"
-        provider = ai.get("provider") or PROVIDER_GO
-        provider_label = "Go" if provider == PROVIDER_GO else "Zen"
-        ai_text = (
-            f"啟用（{mode}，{provider_label}，{ai.get('model') or DEFAULT_MODEL}）"
-        )
+        models = "、".join(ai.get("models") or []) or "未設定模型"
+        ai_text = f"啟用（{mode}，{models}）"
     else:
         ai_text = "停用"
     lines = [
@@ -792,48 +780,76 @@ async def _run_crawler(application, status_chat_id=None):
     evaluate = None
     ai_config = data.get("ai") or {}
     if ai_config.get("enabled"):
-        provider = ai_config.get("provider") or PROVIDER_GO
-        # Environment variables take precedence, but the key entered in the
-        # bot's AI menu is persisted in config.yaml and must work as well.
-        api_key = api_key_from_env(provider) or ai_config.get("api_key")
-        # For Zen, allow empty API key (free models)
-        if provider == PROVIDER_ZEN and not api_key:
-            api_key = None
-        # For Go, API key is required
-        if provider == PROVIDER_GO and not api_key:
-            LOGGER.warning(
-                "AI evaluation is enabled but %s is not set; continuing without AI",
-                GO_API_KEY_ENV,
+        missing = [
+            label
+            for label, value in (
+                ("API endpoint", ai_config.get("api_endpoint")),
+                ("API key", ai_config.get("api_key")),
+                ("models", ai_config.get("models")),
             )
-            api_key = None
-        if api_key is not None or provider == PROVIDER_ZEN:
+            if not value
+        ]
+        if missing:
+            LOGGER.warning(
+                "AI evaluation is enabled but required settings are missing: %s; "
+                "continuing without AI",
+                ", ".join(missing),
+            )
+        else:
             filter_rejected = ai_config.get("filter", True)
+            models = ai_config["models"]
+            model_failures = dict.fromkeys(models, 0)
+            models_exhausted = False
 
             async def evaluate(region, listing, crawl_filters=None):
-                try:
-                    verdict, images = await asyncio.to_thread(
-                        evaluate_listing,
-                        ai_config,
-                        region,
-                        listing,
-                        api_key=api_key,
-                        crawl_filters=crawl_filters,
-                    )
-                except Exception:
-                    LOGGER.exception(
-                        "AI evaluation failed; delivering listing without AI verdict "
-                        "region=%s listing_id=%s provider=%s model=%s",
-                        region,
-                        listing.get("id", "unknown"),
-                        provider,
-                        ai_config.get("model") or DEFAULT_MODEL,
-                        extra={"sensitive_values": (api_key,)},
-                    )
+                nonlocal models_exhausted
+                if models_exhausted:
                     return True
-                listing["ai"] = verdict
-                if images:
-                    listing["images"] = images
-                return bool(verdict["good"]) or not filter_rejected
+                for model in models:
+                    while model_failures[model] < MAX_MODEL_FAILURES_PER_CRAWL:
+                        try:
+                            verdict, images = await asyncio.to_thread(
+                                evaluate_listing,
+                                ai_config,
+                                region,
+                                listing,
+                                model=model,
+                                crawl_filters=crawl_filters,
+                            )
+                        except AIModelError:
+                            model_failures[model] += 1
+                            LOGGER.warning(
+                                "AI model evaluation failed; retrying if available "
+                                "region=%s listing_id=%s model=%s failures=%s/%s",
+                                region,
+                                listing.get("id", "unknown"),
+                                model,
+                                model_failures[model],
+                                MAX_MODEL_FAILURES_PER_CRAWL,
+                                exc_info=True,
+                                extra={"sensitive_values": (ai_config.get("api_key"),)},
+                            )
+                            continue
+                        except Exception:
+                            LOGGER.exception(
+                                "AI evaluation failed; delivering listing without AI verdict "
+                                "region=%s listing_id=%s model=%s",
+                                region,
+                                listing.get("id", "unknown"),
+                                model,
+                                extra={"sensitive_values": (ai_config.get("api_key"),)},
+                            )
+                            return True
+                        listing["ai"] = verdict
+                        if images:
+                            listing["images"] = images
+                        return bool(verdict["good"]) or not filter_rejected
+                models_exhausted = True
+                LOGGER.error(
+                    "All AI models reached the per-crawl failure limit; "
+                    "continuing without AI"
+                )
+                return True
 
     async def notify(region, listing):
         text = _listing_message(region, listing)
@@ -1073,20 +1089,24 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "輸入 - 可恢復預設標準。"
         )
         return
-    elif action == "ai_model":
-        context.user_data["awaiting"] = ("ai_model", None)
-        await query.message.reply_text("請輸入模型 ID，例如：kimi-k3")
+    elif action == "ai_models":
+        context.user_data["awaiting"] = ("ai_models", None)
+        await query.message.reply_text(
+            "請輸入 API 接受的模型 ID，以逗號或換行分隔並依序嘗試。"
+            "每個模型在單次爬蟲失敗五次後會停用。輸入 - 清除。"
+        )
         return
-    elif action == "ai_provider":
-        current = store.load()["ai"].get("provider", PROVIDER_GO)
-        next_provider = PROVIDER_ZEN if current == PROVIDER_GO else PROVIDER_GO
-        store.set_ai_provider(next_provider)
-        view = _ai_view(store.load())
+    elif action == "ai_api_endpoint":
+        context.user_data["awaiting"] = ("ai_api_endpoint", None)
+        await query.message.reply_text(
+            "請輸入 OpenAI Chat Completions API 基礎 URL，例如："
+            "https://api.openai.com/v1；也可輸入完整的 /chat/completions URL。"
+            "輸入 - 清除。"
+        )
+        return
     elif action == "ai_api_key":
         context.user_data["awaiting"] = ("ai_api_key", None)
-        await query.message.reply_text(
-            "請輸入 API 金鑰，或輸入 - 清除（OpenCode Zen 免費模型可留空）。"
-        )
+        await query.message.reply_text("請輸入 API 金鑰，或輸入 - 清除。")
         return
     elif action == "schedule":
         view = _schedule_view(store.load())
@@ -1170,15 +1190,41 @@ async def text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if kind == "ai_model":
+    if kind == "ai_models":
+        models = (
+            []
+            if value == "-"
+            else [
+                model.strip() for model in re.split(r"[,，\n]+", value) if model.strip()
+            ]
+        )
         try:
-            store.set_ai_model(value)
+            if not models and value != "-":
+                raise ValueError
+            store.set_ai_models(models)
         except ValueError:
             context.user_data["awaiting"] = awaiting
-            await update.effective_message.reply_text("模型 ID 無效，例如：kimi-k3")
+            await update.effective_message.reply_text(
+                "模型清單無效；請輸入不重複的模型 ID，並以逗號或換行分隔。"
+            )
             return
         await update.effective_message.reply_text(
-            "AI 模型已更新。請使用 /ai 繼續設定。"
+            "AI 模型清單已更新。請使用 /ai 繼續設定。"
+        )
+        return
+
+    if kind == "ai_api_endpoint":
+        try:
+            store.set_ai_api_endpoint(None if value == "-" else value)
+        except ValueError:
+            context.user_data["awaiting"] = awaiting
+            await update.effective_message.reply_text(
+                "API 端點必須是完整的 HTTP(S) URL，且不可包含登入資訊、"
+                "查詢字串或 fragment。"
+            )
+            return
+        await update.effective_message.reply_text(
+            "AI API 端點已更新。請使用 /ai 繼續設定。"
         )
         return
 

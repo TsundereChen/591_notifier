@@ -230,15 +230,14 @@ def test_listing_message_includes_ai_verdict():
 
 
 def test_ai_view_shows_status_and_controls(monkeypatch):
-    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: "configured")
-
     text, keyboard = _ai_view(
         {
             "ai": {
                 "enabled": True,
                 "filter": False,
-                "provider": "go",
-                "model": "kimi-k3",
+                "api_endpoint": "https://provider.example/v1",
+                "api_key": "configured",
+                "models": ["test-model", "backup-model"],
                 "criteria": "重視採光",
             }
         }
@@ -246,7 +245,7 @@ def test_ai_view_shows_status_and_controls(monkeypatch):
 
     assert "狀態：啟用" in text
     assert "僅在通知中標註評語" in text
-    assert "提供者：OpenCode Go" in text
+    assert "API 端點：https://provider.example/v1" in text
     assert "API 金鑰：已設定" in text
     assert "評估標準：重視採光" in text
     assert {
@@ -255,20 +254,18 @@ def test_ai_view_shows_status_and_controls(monkeypatch):
         "ai_toggle",
         "ai_mode",
         "ai_criteria",
-        "ai_model",
+        "ai_models",
     }
 
 
-def test_ai_view_recognizes_saved_api_key(monkeypatch):
-    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: None)
-
+def test_ai_view_recognizes_saved_api_key():
     text, _ = _ai_view(
         {
             "ai": {
                 "enabled": True,
                 "filter": False,
-                "provider": "go",
-                "model": "kimi-k3",
+                "api_endpoint": "https://provider.example/v1",
+                "models": ["test-model"],
                 "api_key": "saved-key",
             }
         }
@@ -628,13 +625,13 @@ async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
     await callback(harness.update, harness.context)
     assert harness.store.load()["ai"]["filter"] is False
 
-    harness.query.data = "ai_provider"
+    harness.query.data = "ai_api_endpoint"
     await callback(harness.update, harness.context)
-    assert harness.store.load()["ai"]["provider"] == "zen"
-
-    harness.query.data = "ai_provider"
-    await callback(harness.update, harness.context)
-    assert harness.store.load()["ai"]["provider"] == "go"
+    assert harness.context.user_data["awaiting"] == ("ai_api_endpoint", None)
+    harness.message.text = "https://provider.example/v1"
+    await bot.text_input(harness.update, harness.context)
+    assert harness.store.load()["ai"]["api_endpoint"] == "https://provider.example/v1"
+    assert "/ai" in harness.message.reply_text.await_args.args[0]
 
     harness.query.data = "ai_criteria"
     await callback(harness.update, harness.context)
@@ -644,20 +641,23 @@ async def test_ai_callbacks_and_text_input_persist_settings(bot_harness):
     assert harness.store.load()["ai"]["criteria"] == "重視採光"
     assert "/ai" in harness.message.reply_text.await_args.args[0]
 
-    harness.query.data = "ai_model"
+    harness.query.data = "ai_models"
     await callback(harness.update, harness.context)
-    assert harness.context.user_data["awaiting"] == ("ai_model", None)
-    harness.message.text = "mimo-v2-omni"
+    assert harness.context.user_data["awaiting"] == ("ai_models", None)
+    harness.message.text = "mimo-v2-omni, openai/gpt-4o"
     await bot.text_input(harness.update, harness.context)
-    assert harness.store.load()["ai"]["model"] == "mimo-v2-omni"
+    assert harness.store.load()["ai"]["models"] == [
+        "mimo-v2-omni",
+        "openai/gpt-4o",
+    ]
     assert "/ai" in harness.message.reply_text.await_args.args[0]
 
     harness.query.data = "ai_api_key"
     await callback(harness.update, harness.context)
     assert harness.context.user_data["awaiting"] == ("ai_api_key", None)
-    harness.message.text = "test-zen-key"
+    harness.message.text = "test-key"
     await bot.text_input(harness.update, harness.context)
-    assert harness.store.load()["ai"]["api_key"] == "test-zen-key"
+    assert harness.store.load()["ai"]["api_key"] == "test-key"
     assert "/ai" in harness.message.reply_text.await_args.args[0]
 
     harness.query.data = "ai_api_key"
@@ -1107,12 +1107,15 @@ async def test_run_crawler_wires_ai_evaluation_and_filtering(bot_harness, monkey
         assert listing["images"] == ["https://img.591.com.tw/one.jpg"]
         return {"regions": []}
 
-    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: "test-key")
+    bot_harness.store.set_ai_api_endpoint("https://provider.example/v1")
+    bot_harness.store.set_ai_models(["test-model"])
+    bot_harness.store.set_ai_api_key("test-key")
     monkeypatch.setattr(bot, "evaluate_listing", judge)
     monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
 
     assert await bot._run_crawler(bot_harness.application) == {"regions": []}
-    assert judge.call_args.kwargs["api_key"] == "test-key"
+    assert judge.call_args.args[0]["api_endpoint"] == "https://provider.example/v1"
+    assert judge.call_args.kwargs["model"] == "test-model"
 
 
 @pytest.mark.asyncio
@@ -1121,6 +1124,9 @@ async def test_run_crawler_logs_ai_evaluation_failure_with_context(
 ):
     bot_harness.store.toggle_region(3)
     bot_harness.store.set_ai_enabled(True)
+    bot_harness.store.set_ai_api_endpoint("https://provider.example/v1")
+    bot_harness.store.set_ai_models(["test-model"])
+    bot_harness.store.set_ai_api_key("test-key")
     judge = MagicMock(side_effect=RuntimeError("AI provider unavailable"))
 
     async def fake_crawl(config_path, notify, *, evaluate):
@@ -1128,7 +1134,6 @@ async def test_run_crawler_logs_ai_evaluation_failure_with_context(
         return {"regions": []}
 
     caplog.set_level(logging.ERROR, logger="rent591_notifier.bot")
-    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: "test-key")
     monkeypatch.setattr(bot, "evaluate_listing", judge)
     monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
 
@@ -1137,14 +1142,70 @@ async def test_run_crawler_logs_ai_evaluation_failure_with_context(
     assert (
         "AI evaluation failed; delivering listing without AI verdict" in record.message
     )
-    assert "region=新北市 listing_id=abc provider=go model=kimi-k3" in record.message
+    assert "region=新北市 listing_id=abc model=test-model" in record.message
     assert record.exc_info is not None
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_disables_model_after_five_failures(bot_harness, monkeypatch):
+    bot_harness.store.toggle_region(3)
+    bot_harness.store.set_ai_enabled(True)
+    bot_harness.store.set_ai_api_endpoint("https://provider.example/v1")
+    bot_harness.store.set_ai_models(["primary-model", "backup-model"])
+    bot_harness.store.set_ai_api_key("test-key")
+    success = ({"good": True, "score": 8, "reason": "推薦"}, [])
+    judge = MagicMock(
+        side_effect=[bot.AIModelError("unavailable")] * 5 + [success, success]
+    )
+
+    async def fake_crawl(config_path, notify, *, evaluate):
+        assert await evaluate("新北市", {"id": "first"}, {}) is True
+        assert await evaluate("新北市", {"id": "second"}, {}) is True
+        return {"regions": []}
+
+    monkeypatch.setattr(bot, "evaluate_listing", judge)
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+
+    assert await bot._run_crawler(bot_harness.application) == {"regions": []}
+    assert [call.kwargs["model"] for call in judge.call_args_list] == [
+        "primary-model",
+        "primary-model",
+        "primary-model",
+        "primary-model",
+        "primary-model",
+        "backup-model",
+        "backup-model",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_skips_ai_after_all_models_fail(bot_harness, monkeypatch):
+    bot_harness.store.toggle_region(3)
+    bot_harness.store.set_ai_enabled(True)
+    bot_harness.store.set_ai_api_endpoint("https://provider.example/v1")
+    bot_harness.store.set_ai_models(["first-model", "second-model"])
+    bot_harness.store.set_ai_api_key("test-key")
+    judge = MagicMock(side_effect=bot.AIModelError("unavailable"))
+
+    async def fake_crawl(config_path, notify, *, evaluate):
+        assert await evaluate("新北市", {"id": "first"}, {}) is True
+        assert judge.call_count == 10
+        assert await evaluate("新北市", {"id": "second"}, {}) is True
+        assert judge.call_count == 10
+        return {"regions": []}
+
+    monkeypatch.setattr(bot, "evaluate_listing", judge)
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+
+    assert await bot._run_crawler(bot_harness.application) == {"regions": []}
 
 
 @pytest.mark.asyncio
 async def test_run_crawler_uses_api_key_saved_in_ai_settings(bot_harness, monkeypatch):
     bot_harness.store.toggle_region(3)
     bot_harness.store.set_ai_enabled(True)
+    bot_harness.store.set_ai_api_endpoint("https://provider.example/v1")
+    bot_harness.store.set_ai_models(["test-model"])
     bot_harness.store.set_ai_api_key("saved-key")
     judge = MagicMock(return_value=({"good": True, "score": 8, "reason": "推薦"}, []))
 
@@ -1156,12 +1217,11 @@ async def test_run_crawler_uses_api_key_saved_in_ai_settings(bot_harness, monkey
         )
         return {"regions": []}
 
-    monkeypatch.setattr(bot, "api_key_from_env", lambda provider: None)
     monkeypatch.setattr(bot, "evaluate_listing", judge)
     monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
 
     assert await bot._run_crawler(bot_harness.application) == {"regions": []}
-    assert judge.call_args.kwargs["api_key"] == "saved-key"
+    assert judge.call_args.args[0]["api_key"] == "saved-key"
 
 
 @pytest.mark.asyncio

@@ -17,11 +17,11 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     assert initial["ai"] == {
         "enabled": False,
         "filter": True,
-        "provider": "go",
-        "model": "kimi-k3",
+        "api_endpoint": None,
+        "api_key": None,
+        "models": [],
         "criteria": None,
         "max_images": 6,
-        "api_key": None,
     }
 
     store.set_owner(123, 456)
@@ -32,10 +32,10 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     store.set_schedule("0 * * * *")
     store.set_ai_enabled(True)
     store.set_ai_filter(False)
-    store.set_ai_provider("zen")
-    store.set_ai_model("mimo-v2-omni")
+    store.set_ai_api_endpoint("https://provider.example/v1/")
+    store.set_ai_models(["mimo-v2-omni", "openai/gpt-4o"])
     store.set_ai_criteria("重視採光與捷運距離")
-    store.set_ai_api_key("test-zen-key")
+    store.set_ai_api_key("test-key")
 
     reloaded = ConfigStore(path).load()
     assert reloaded["telegram"] == {"owner_user_id": 123, "chat_id": 456}
@@ -43,11 +43,11 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
     assert reloaded["ai"] == {
         "enabled": True,
         "filter": False,
-        "provider": "zen",
-        "model": "mimo-v2-omni",
+        "api_endpoint": "https://provider.example/v1",
+        "api_key": "test-key",
+        "models": ["mimo-v2-omni", "openai/gpt-4o"],
         "criteria": "重視採光與捷運距離",
         "max_images": 6,
-        "api_key": "test-zen-key",
     }
     assert reloaded["crawl"] == [
         {
@@ -102,7 +102,38 @@ def test_template_is_copied_when_runtime_config_is_missing(tmp_path):
     assert data["database"] == "custom.db"
     assert data["schedule"] == "0 8 * * *"
     assert data["timezone"] == "Asia/Taipei"
-    assert data["ai"]["provider"] == "go"
+    assert data["ai"]["api_endpoint"] is None
+
+
+@pytest.mark.parametrize(
+    ("provider", "endpoint"),
+    [
+        ("go", "https://opencode.ai/zen/go/v1"),
+        ("zen", "https://opencode.ai/zen/v1"),
+    ],
+)
+def test_legacy_ai_provider_is_migrated(tmp_path, provider, endpoint):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"ai:\n  provider: {provider}\n  api_key: saved-key\n  model: kimi-k3\ncrawl: []\n",
+        encoding="utf-8",
+    )
+
+    ai_config = ConfigStore(path).load()["ai"]
+
+    assert "provider" not in ai_config
+    assert ai_config["api_endpoint"] == endpoint
+    assert ai_config["api_key"] == "saved-key"
+    assert ai_config["models"] == ["kimi-k3"]
+
+
+def test_model_ids_used_by_compatible_gateways_are_accepted(tmp_path):
+    store = ConfigStore(tmp_path / "config.yaml")
+    models = ["openai/gpt-4o", "llama3.1:8b"]
+
+    store.set_ai_models(models)
+
+    assert store.load()["ai"]["models"] == models
 
 
 def test_old_pages_option_is_removed(tmp_path):
@@ -152,10 +183,16 @@ def test_instance_lock_rejects_second_process_lock(tmp_path):
     [
         ("enabled: nope", "ai.enabled"),
         ("filter: nope", "ai.filter"),
-        ("provider: invalid", "ai.provider"),
-        ("model: invalid model", "ai.model"),
+        ("model: invalid model", "ai.models"),
+        ("models: not-a-list", "ai.models"),
+        ("models: [invalid model]", "ai.models"),
+        ("models: [same-model, same-model]", "ai.models"),
         ("max_images: 11", "ai.max_images"),
         ("api_key: 123", "ai.api_key"),
+        ("api_endpoint: not-a-url", "ai.api_endpoint"),
+        ("api_endpoint: https://user:pass@example.com/v1", "ai.api_endpoint"),
+        ("api_endpoint: https://example.com/v1?token=x", "ai.api_endpoint"),
+        ("api_endpoint: https://example.com/v1#fragment", "ai.api_endpoint"),
     ],
 )
 def test_invalid_ai_configuration_is_rejected(tmp_path, ai_config, message):

@@ -1,8 +1,8 @@
-"""Evaluate 591 listings with an OpenCode chat model, including photos.
+"""Evaluate 591 listings with an OpenAI-compatible chat model, including photos.
 
 The evaluator fetches the listing detail page, flattens every structured
 field into a prompt, downloads the album images itself, and asks an
-OpenAI-compatible chat model (OpenCode Go or Zen) for a JSON verdict of the form
+OpenAI-compatible chat model for a JSON verdict of the form
 {"good": bool, "score": 0-10, "reason": str}.
 """
 
@@ -11,10 +11,9 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import re
 import ssl
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urlparse
 
 import requests
@@ -23,21 +22,6 @@ from .crawler import HEADERS, crawl_rent_details
 
 LOGGER = logging.getLogger(__name__)
 
-# Provider constants
-PROVIDER_GO = "go"
-PROVIDER_ZEN = "zen"
-PROVIDER_CHOICES = (PROVIDER_GO, PROVIDER_ZEN)
-
-GO_API_KEY_ENV = "OPENCODE_GO_API_KEY"
-ZEN_API_KEY_ENV = "OPENCODE_ZEN_API_KEY"
-# Backwards compatibility
-API_KEY_ENV = GO_API_KEY_ENV
-
-GO_BASE_URL = "https://opencode.ai/zen/go/v1"
-ZEN_BASE_URL = "https://opencode.ai/zen/v1"
-
-DEFAULT_PROVIDER = PROVIDER_GO
-DEFAULT_MODEL = "kimi-k3"
 DEFAULT_MAX_IMAGES = 6
 MAX_IMAGES_LIMIT = 10
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -65,7 +49,11 @@ class AIEvaluationError(RuntimeError):
     """Raised when a listing cannot be evaluated by the AI provider."""
 
 
-class _BadRequestError(AIEvaluationError):
+class AIModelError(AIEvaluationError):
+    """Raised when a model request or response fails."""
+
+
+class _BadRequestError(AIModelError):
     """An HTTP 400 from the provider; the request may work with fewer options."""
 
 
@@ -85,18 +73,6 @@ class _ImageHTTPAdapter(requests.adapters.HTTPAdapter):
     def proxy_manager_for(self, proxy: str, **proxy_kwargs: Any) -> Any:
         proxy_kwargs["ssl_context"] = self._ssl_context()
         return super().proxy_manager_for(proxy, **proxy_kwargs)
-
-
-def api_key_from_env(provider: Literal["go", "zen"] = PROVIDER_GO) -> str | None:
-    """Return the configured OpenCode API key for the given provider, if any."""
-    env_var = GO_API_KEY_ENV if provider == PROVIDER_GO else ZEN_API_KEY_ENV
-    value = os.getenv(env_var)
-    return value.strip() if value and value.strip() else None
-
-
-def base_url_for_provider(provider: Literal["go", "zen"] = PROVIDER_GO) -> str:
-    """Return the base URL for the given provider."""
-    return GO_BASE_URL if provider == PROVIDER_GO else ZEN_BASE_URL
 
 
 def _section_lines(title: str, pairs: dict[str, Any]) -> list[str]:
@@ -249,7 +225,7 @@ def _download_image(url: str, timeout: int = 30) -> str | None:
 
 def _chat_completion(
     api_key: str | None,
-    base_url: str,
+    api_endpoint: str,
     model: str,
     messages: list[dict[str, Any]],
     *,
@@ -265,42 +241,47 @@ def _chat_completion(
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    request_url = (
+        api_endpoint
+        if api_endpoint.endswith("/chat/completions")
+        else f"{api_endpoint}/chat/completions"
+    )
     try:
         resp = requests.post(
-            f"{base_url}/chat/completions",
+            request_url,
             headers=headers,
             json=payload,
             timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
-        raise AIEvaluationError(f"AI request failed: {exc}") from exc
+        raise AIModelError(f"AI request failed: {exc}") from exc
     if resp.status_code == 400:
         raise _BadRequestError("AI provider rejected the request with HTTP 400")
     if resp.status_code != 200:
-        raise AIEvaluationError(f"AI provider returned HTTP {resp.status_code}")
+        raise AIModelError(f"AI provider returned HTTP {resp.status_code}")
     try:
         content = resp.json()["choices"][0]["message"]["content"]
     except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise AIEvaluationError("AI provider returned an invalid payload") from exc
+        raise AIModelError("AI provider returned an invalid payload") from exc
     if isinstance(content, list):
         content = "".join(
             part.get("text", "") for part in content if isinstance(part, dict)
         )
     if not isinstance(content, str) or not content.strip():
-        raise AIEvaluationError("AI provider returned an empty response")
+        raise AIModelError("AI provider returned an empty response")
     return content
 
 
 def _parse_verdict(text: str) -> dict[str, Any]:
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        raise AIEvaluationError("AI response did not contain a JSON object")
+        raise AIModelError("AI response did not contain a JSON object")
     try:
         data = json.loads(match.group(0))
     except ValueError as exc:
-        raise AIEvaluationError("AI response contained invalid JSON") from exc
+        raise AIModelError("AI response contained invalid JSON") from exc
     if not isinstance(data, dict) or "good" not in data:
-        raise AIEvaluationError("AI response JSON is missing 'good'")
+        raise AIModelError("AI response JSON is missing 'good'")
     raw_good = data["good"]
     if isinstance(raw_good, str):
         good = raw_good.strip().lower() in ("true", "1", "yes", "是", "好")
@@ -322,8 +303,8 @@ def evaluate_listing(
     region: str,
     listing: dict[str, Any],
     *,
+    model: str,
     detail_fetcher=crawl_rent_details,
-    api_key: str | None = None,
     crawl_filters: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Evaluate one listing and return (verdict, album image URLs).
@@ -334,24 +315,20 @@ def evaluate_listing(
     ``crawl_filters`` contains the human-readable search constraints that
     selected the listing.
     """
-    provider = str(ai_config.get("provider") or DEFAULT_PROVIDER)
-    if provider not in PROVIDER_CHOICES:
-        provider = DEFAULT_PROVIDER
-
-    # An explicit value is useful to callers; otherwise use the deployment
-    # environment before the key persisted in the local configuration.
-    config_api_key = ai_config.get("api_key")
-    api_key = api_key if api_key is not None else api_key_from_env(provider)
-    if not api_key:
-        api_key = config_api_key
-
-    # For Zen, allow empty API key (free models)
-    if provider == PROVIDER_ZEN and not api_key:
-        api_key = None
-
-    # For Go, API key is required
-    if provider == PROVIDER_GO and not api_key:
-        raise AIEvaluationError(f"{GO_API_KEY_ENV} is not set")
+    api_endpoint = str(ai_config.get("api_endpoint") or "").strip().rstrip("/")
+    api_key = str(ai_config.get("api_key") or "").strip()
+    model = str(model or "").strip()
+    missing = [
+        label
+        for label, value in (
+            ("API endpoint", api_endpoint),
+            ("API key", api_key),
+            ("model", model),
+        )
+        if not value
+    ]
+    if missing:
+        raise AIEvaluationError("AI evaluation requires " + ", ".join(missing))
 
     url = listing.get("url")
     if not url:
@@ -365,7 +342,6 @@ def evaluate_listing(
     if not isinstance(detail, dict) or detail.get("error"):
         raise AIEvaluationError(f"could not load listing detail for {url}")
 
-    model = str(ai_config.get("model") or DEFAULT_MODEL)
     criteria = str(ai_config.get("criteria") or DEFAULT_CRITERIA)
     criteria = criteria[:MAX_CRITERIA_CHARS]
     try:
@@ -393,7 +369,6 @@ def evaluate_listing(
     if not image_parts:
         attempts = [(True, False), (False, False)]
     last_error: AIEvaluationError | None = None
-    base_url = base_url_for_provider(provider)
     for json_mode, with_images in attempts:
         user_content: list[dict[str, Any]] = [{"type": "text", "text": text}]
         if with_images:
@@ -404,7 +379,7 @@ def evaluate_listing(
         ]
         try:
             content = _chat_completion(
-                api_key, base_url, model, messages, json_mode=json_mode
+                api_key, api_endpoint, model, messages, json_mode=json_mode
             )
         except _BadRequestError as exc:
             last_error = exc
@@ -418,14 +393,12 @@ def evaluate_listing(
             continue
         verdict = _parse_verdict(content)
         LOGGER.info(
-            "AI evaluation completed listing_id=%s good=%s score=%s images=%s provider=%s",
+            "AI evaluation completed listing_id=%s good=%s score=%s images=%s model=%s",
             listing.get("id", "unknown"),
             verdict["good"],
             verdict["score"],
             len(image_parts) if with_images else 0,
-            provider,
+            model,
         )
         return verdict, image_urls
-    raise AIEvaluationError(
-        "AI provider rejected every request variant"
-    ) from last_error
+    raise AIModelError("AI provider rejected every request variant") from last_error
