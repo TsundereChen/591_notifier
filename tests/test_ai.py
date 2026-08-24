@@ -94,6 +94,7 @@ def test_evaluate_listing_sends_full_detail_and_images(monkeypatch):
     assert request["model"] == "test-model"
     assert request["response_format"] == {"type": "json_object"}
     assert post.call_args.kwargs["headers"] == {"Authorization": "Bearer test-key"}
+    assert post.call_args.kwargs["timeout"] == 60
     assert post.call_args.args[0] == "https://provider.example/v1/chat/completions"
     user_content = request["messages"][1]["content"]
     prompt = user_content[0]["text"]

@@ -1155,11 +1155,13 @@ async def test_run_crawler_disables_model_after_five_failures(bot_harness, monke
     bot_harness.store.set_ai_api_key("test-key")
     success = ({"good": True, "score": 8, "reason": "推薦"}, [])
     judge = MagicMock(
-        side_effect=([bot.AIModelError("unavailable"), success] * 5) + [success]
+        side_effect=[bot.AIModelError("unavailable"), success, success]
+        + ([bot.AIModelError("unavailable"), success] * 4)
+        + [success]
     )
 
     async def fake_crawl(config_path, notify, *, evaluate):
-        for index in range(6):
+        for index in range(7):
             assert await evaluate("新北市", {"id": str(index)}, {}) is True
         return {"regions": []}
 
@@ -1171,6 +1173,7 @@ async def test_run_crawler_disables_model_after_five_failures(bot_harness, monke
         "primary-model",
         "backup-model",
         "primary-model",
+        "primary-model",
         "backup-model",
         "primary-model",
         "backup-model",
@@ -1180,6 +1183,37 @@ async def test_run_crawler_disables_model_after_five_failures(bot_harness, monke
         "backup-model",
         "backup-model",
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_limits_ai_time_per_listing(bot_harness, monkeypatch):
+    bot_harness.store.toggle_region(3)
+    bot_harness.store.set_ai_enabled(True)
+    bot_harness.store.set_ai_api_endpoint("https://provider.example/v1")
+    bot_harness.store.set_ai_models(["test-model", "backup-model"])
+    bot_harness.store.set_ai_api_key("test-key")
+    timeouts = []
+
+    async def timeout_wait_for(awaitable, *, timeout):
+        timeouts.append(timeout)
+        awaitable.close()
+        raise TimeoutError
+
+    async def fake_crawl(config_path, notify, *, evaluate):
+        listing = {"id": "slow"}
+        assert await evaluate("新北市", listing, {}) is True
+        assert listing["ai"] == {"unavailable": True}
+        return {"regions": []}
+
+    judge = MagicMock()
+    monkeypatch.setattr(bot.asyncio, "wait_for", timeout_wait_for)
+    monkeypatch.setattr(bot, "evaluate_listing", judge)
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+
+    assert await bot._run_crawler(bot_harness.application) == {"regions": []}
+    assert len(timeouts) == 1
+    assert 0 < timeouts[0] <= bot.AI_TIMEOUT_PER_LISTING
+    judge.assert_not_called()
 
 
 @pytest.mark.asyncio

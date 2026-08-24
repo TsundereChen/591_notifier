@@ -50,6 +50,7 @@ from .notifier import crawl_and_notify
 LOGGER = logging.getLogger(__name__)
 CRAWL_JOB_NAME = "scheduled-crawl"
 MAX_MODEL_FAILURES_PER_CRAWL = 5
+AI_TIMEOUT_PER_LISTING = 5 * 60
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 REDACTED = "[REDACTED]"
 TELEGRAM_BOT_TOKEN_PATTERN = re.compile(
@@ -811,18 +812,41 @@ async def _run_crawler(application, status_chat_id=None):
                 if models_exhausted:
                     listing["ai"] = {"unavailable": True}
                     return True
+                deadline = asyncio.get_running_loop().time() + AI_TIMEOUT_PER_LISTING
                 for model in models:
                     if model_failures[model] >= MAX_MODEL_FAILURES_PER_CRAWL:
                         continue
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        listing["ai"] = {"unavailable": True}
+                        return True
                     try:
-                        verdict, images = await asyncio.to_thread(
-                            evaluate_listing,
-                            ai_config,
-                            region,
-                            listing,
-                            model=model,
-                            crawl_filters=crawl_filters,
+                        verdict, images = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                evaluate_listing,
+                                ai_config,
+                                region,
+                                listing,
+                                model=model,
+                                crawl_filters=crawl_filters,
+                            ),
+                            timeout=remaining,
                         )
+                    except TimeoutError:
+                        model_failures[model] += 1
+                        LOGGER.warning(
+                            "AI listing evaluation exceeded the per-listing timeout; "
+                            "delivering without AI verdict region=%s listing_id=%s "
+                            "model=%s timeout_s=%s failures=%s/%s",
+                            region,
+                            listing.get("id", "unknown"),
+                            model,
+                            AI_TIMEOUT_PER_LISTING,
+                            model_failures[model],
+                            MAX_MODEL_FAILURES_PER_CRAWL,
+                        )
+                        listing["ai"] = {"unavailable": True}
+                        return True
                     except AIModelError:
                         model_failures[model] += 1
                         LOGGER.warning(
@@ -848,9 +872,6 @@ async def _run_crawler(application, status_chat_id=None):
                         )
                         listing["ai"] = {"unavailable": True}
                         return True
-                    # A success clears this model's failure count so a few isolated
-                    # hiccups earlier in a long crawl don't permanently disable it.
-                    model_failures[model] = 0
                     listing["ai"] = verdict
                     if images:
                         listing["images"] = images
