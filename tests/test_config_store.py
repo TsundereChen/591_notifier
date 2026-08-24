@@ -21,7 +21,7 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
         "api_key": None,
         "models": [],
         "criteria": None,
-        "max_images": 6,
+        "max_images": 10,
     }
 
     store.set_owner(123, 456)
@@ -47,7 +47,7 @@ def test_store_bootstraps_and_persists_settings(tmp_path):
         "api_key": "test-key",
         "models": ["mimo-v2-omni", "openai/gpt-4o"],
         "criteria": "重視採光與捷運距離",
-        "max_images": 6,
+        "max_images": 10,
     }
     assert reloaded["crawl"] == [
         {

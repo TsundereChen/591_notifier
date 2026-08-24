@@ -33,7 +33,7 @@ ai:
   # 分析照片時請選擇支援 image input 的模型。
   models: [] # 例如：[gpt-4o-mini, openai/gpt-4o]
   criteria: # 可填寫自訂偏好；留空時使用預設的租金、屋況、採光與紅旗評估。
-  max_images: 6
+  max_images: 10
 
 crawl:
   - region: 新北市

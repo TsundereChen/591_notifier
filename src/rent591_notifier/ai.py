@@ -22,7 +22,7 @@ from .crawler import HEADERS, crawl_rent_details
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_MAX_IMAGES = 6
+DEFAULT_MAX_IMAGES = 10
 MAX_IMAGES_LIMIT = 10
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_DESCRIPTION_CHARS = 2000
