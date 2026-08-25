@@ -21,6 +21,7 @@ from rent591_notifier.bot import (
     _cron_trigger,
     _format_schedule,
     _home_view,
+    _listing_detail,
     _listing_message,
     _listing_images,
     _price_view,
@@ -59,6 +60,7 @@ def bot_harness(tmp_path):
             send_media_group=AsyncMock(),
             send_message=AsyncMock(),
             send_photo=AsyncMock(),
+            send_location=AsyncMock(),
             set_my_commands=AsyncMock(),
         ),
         job_queue=FakeJobQueue(),
@@ -204,7 +206,7 @@ def test_listing_message_contains_essential_fields():
             "url": "https://rent.591.com.tw/123",
         },
     )
-    assert "Sunny apartment" in text
+    assert "Sunny apartment" not in text
     assert "20,000元/月" in text
     assert "土城區-中央路" in text
     assert text.endswith("https://rent.591.com.tw/123")
@@ -227,6 +229,207 @@ def test_listing_message_includes_ai_verdict():
 
     assert "🤖 AI 評估：⚠️ 不推薦（3/10）" in text
     assert "💭 租金偏高" in text
+
+
+def test_listing_message_includes_detail_page_fields():
+    listing = {
+        "title": "list title",
+        "price": "39,000元/月",
+        "location": "中山區-新生北路三段",
+        "url": "https://rent.591.com.tw/21713336",
+        "nearby_transit": {"type": "metro", "text": "距中山國小站457公尺"},
+        "tags": ["急租"],
+        "updated": "45分鐘內更新",
+        "views": "瀏覽23418",
+    }
+    detail = {
+        "title": "detail title",
+        "preferred": True,
+        "labels": ["近捷運", "可開伙"],
+        "layout": "3房2廳2衛",
+        "area": "42.09坪",
+        "floor": "電梯大樓",
+        "address": "中山區新生北路三段84巷",
+        "community": "測試社區",
+        "details": {
+            "基礎資料": {"屋齡": "-", "電梯": "有", "其他特色": "近捷運、可開伙"},
+            "房屋價格": {"押金": "二個月", "管理費": "700元/月"},
+        },
+        "rental_notes": {"最短租期": "一年", "養寵物": "不可養寵物"},
+        "facilities": {"provided": ["冷氣", "熱水器"], "not_provided": ["冰箱"]},
+        "description": "屋況介紹全文",
+        "poster": "仲介: 王小姐",
+        "poster_info": "經紀業: 樂橙房屋仲介有限公司",
+    }
+
+    text = _listing_message("台北市", listing, detail)
+
+    assert "list title" not in text
+    assert "detail title" not in text
+    assert "⭐ 優選物件" in text
+    assert "🗺 中山區新生北路三段84巷" in text
+    assert "🏘 社區：測試社區" in text
+    assert "🚇 距中山國小站457公尺" in text
+    assert "🏷 急租、近捷運、可開伙" in text
+    assert "📐 基礎資料\n  • 屋齡：-\n  • 電梯：有" in text
+    assert "其他特色" not in text
+    assert "💵 房屋價格\n  • 押金：二個月\n  • 管理費：700元/月" in text
+    assert "📋 租住說明\n  • 最短租期：一年\n  • 養寵物：不可養寵物" in text
+    assert "🛋 提供設備：冷氣、熱水器" in text
+    assert "未提供" not in text
+    assert "冰箱" not in text
+    assert "屋況介紹全文" not in text
+    assert "👤 仲介: 王小姐（經紀業: 樂橙房屋仲介有限公司）" in text
+    assert "🕒 45分鐘內更新 ・ 瀏覽23418" in text
+    assert text.endswith("https://rent.591.com.tw/21713336")
+
+
+def test_listing_message_truncates_long_detail_section_and_stays_under_limit():
+    listing = {"url": "https://rent.591.com.tw/123"}
+    detail = {"rental_notes": {"備註": "字" * 5000}}
+
+    text = _listing_message("台北市", listing, detail)
+
+    assert len(text) <= bot.TELEGRAM_MESSAGE_LIMIT
+    assert text.endswith("https://rent.591.com.tw/123")
+    assert "…" in text
+
+
+@pytest.mark.asyncio
+async def test_listing_coordinates_geocodes_region_qualified_address(monkeypatch):
+    calls = []
+
+    def fake_geocode(query, timeout=10):
+        calls.append(query)
+        return (25.06, 121.53)
+
+    monkeypatch.setattr(bot, "_geocode_address", fake_geocode)
+
+    result = await bot._listing_coordinates(
+        "台北市", {"address": "中山區新生北路三段84巷"}
+    )
+
+    assert result == (25.06, 121.53)
+    assert calls == ["台北市中山區新生北路三段84巷"]
+
+
+@pytest.mark.asyncio
+async def test_listing_coordinates_does_not_duplicate_region(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        bot, "_geocode_address", lambda query, timeout=10: calls.append(query)
+    )
+
+    await bot._listing_coordinates(
+        "台北市", {"address": "台北市中山區新生北路三段84巷"}
+    )
+
+    assert calls == ["台北市中山區新生北路三段84巷"]
+
+
+@pytest.mark.asyncio
+async def test_listing_coordinates_returns_none_without_address():
+    assert await bot._listing_coordinates("台北市", {}) is None
+
+
+def test_geocode_address_parses_first_result(monkeypatch):
+    monkeypatch.setattr(bot, "_last_geocode_call", 0.0)
+    response = MagicMock()
+    response.json.return_value = [{"lat": "25.06", "lon": "121.53"}]
+    response.raise_for_status.return_value = None
+    monkeypatch.setattr(bot.requests, "get", MagicMock(return_value=response))
+
+    assert bot._geocode_address("台北市中山區新生北路三段84巷") == (25.06, 121.53)
+
+
+def test_geocode_address_returns_none_when_no_results(monkeypatch):
+    monkeypatch.setattr(bot, "_last_geocode_call", 0.0)
+    response = MagicMock()
+    response.json.return_value = []
+    response.raise_for_status.return_value = None
+    monkeypatch.setattr(bot.requests, "get", MagicMock(return_value=response))
+
+    assert bot._geocode_address("不存在的地址") is None
+
+
+def test_geocode_address_falls_back_to_road_level_when_alley_has_no_match(monkeypatch):
+    calls = []
+
+    def fake_once(query, timeout=10):
+        calls.append(query)
+        return None if query.endswith("84巷") else (25.06, 121.53)
+
+    monkeypatch.setattr(bot, "_geocode_address_once", fake_once)
+
+    result = bot._geocode_address("台北市中山區新生北路三段84巷")
+
+    assert result == (25.06, 121.53)
+    assert calls == ["台北市中山區新生北路三段84巷", "台北市中山區新生北路三段"]
+
+
+def test_geocode_address_gives_up_after_road_level_still_has_no_match(monkeypatch):
+    monkeypatch.setattr(bot, "_geocode_address_once", lambda query, timeout=10: None)
+
+    assert bot._geocode_address("台北市中山區新生北路三段84巷") is None
+
+
+def test_geocode_address_returns_none_on_request_error(monkeypatch):
+    monkeypatch.setattr(bot, "_last_geocode_call", 0.0)
+    monkeypatch.setattr(
+        bot.requests,
+        "get",
+        MagicMock(side_effect=bot.requests.RequestException("boom")),
+    )
+
+    assert bot._geocode_address("不存在的地址") is None
+
+
+def test_fit_caption_keeps_short_text_unchanged():
+    text = "short message"
+    assert bot._fit_caption(text) == text
+
+
+def test_fit_caption_truncates_body_and_preserves_trailing_url():
+    body = "字" * 2000
+    url = "https://rent.591.com.tw/123"
+    text = f"{body}\n\n{url}"
+
+    caption = bot._fit_caption(text)
+
+    assert len(caption) <= bot.TELEGRAM_CAPTION_LIMIT
+    assert caption.endswith(url)
+    assert "…" in caption
+
+
+@pytest.mark.asyncio
+async def test_listing_detail_returns_parsed_payload(monkeypatch):
+    detail_crawl = MagicMock(
+        return_value=bot.json.dumps({"listings": [{"address": "測試地址"}]})
+    )
+    monkeypatch.setattr(bot, "crawl_rent_details", detail_crawl)
+
+    result = await _listing_detail({"id": "123", "url": "https://rent.591.com.tw/123"})
+
+    assert result == {"address": "測試地址"}
+    detail_crawl.assert_called_once_with("https://rent.591.com.tw/123", delay=0)
+
+
+@pytest.mark.asyncio
+async def test_listing_detail_returns_empty_dict_without_url():
+    assert await _listing_detail({"id": "123"}) == {}
+
+
+@pytest.mark.asyncio
+async def test_listing_detail_returns_empty_dict_on_crawl_error(monkeypatch):
+    monkeypatch.setattr(
+        bot,
+        "crawl_rent_details",
+        MagicMock(return_value=bot.json.dumps({"listings": [{"error": "failed"}]})),
+    )
+
+    result = await _listing_detail({"id": "123", "url": "https://rent.591.com.tw/123"})
+
+    assert result == {}
 
 
 def test_ai_view_shows_status_and_controls(monkeypatch):
@@ -274,61 +477,51 @@ def test_ai_view_recognizes_saved_api_key():
     assert "API 金鑰：已設定" in text
 
 
-@pytest.mark.asyncio
-async def test_listing_images_loads_detail_album_deduplicates_and_caps(monkeypatch):
+def test_listing_images_uses_detail_album_deduplicates_and_caps():
     images = [f"https://img.591.com.tw/{index}.jpg" for index in range(12)]
     images.insert(2, images[0])
-    detail_crawl = MagicMock(
-        return_value=bot.json.dumps({"listings": [{"images": images}]})
-    )
-    monkeypatch.setattr(bot, "crawl_rent_details", detail_crawl)
 
-    result = await _listing_images(
+    result = _listing_images(
         {
             "id": "123",
             "url": "https://rent.591.com.tw/123",
             "image": "https://img.591.com.tw/thumbnail.jpg",
-        }
+        },
+        {"images": images},
     )
 
     assert result == [f"https://img.591.com.tw/{index}.jpg" for index in range(10)]
     assert len(result) == MAX_IMAGES_PER_LISTING
-    detail_crawl.assert_called_once_with("https://rent.591.com.tw/123", delay=0)
 
 
-@pytest.mark.asyncio
-async def test_listing_images_falls_back_to_list_thumbnail(monkeypatch):
-    monkeypatch.setattr(
-        bot,
-        "crawl_rent_details",
-        MagicMock(return_value=bot.json.dumps({"listings": [{"error": "failed"}]})),
-    )
-
-    result = await _listing_images(
+def test_listing_images_falls_back_to_list_thumbnail():
+    result = _listing_images(
         {
             "id": "123",
             "url": "https://rent.591.com.tw/123",
             "image": "https://img.591.com.tw/thumbnail.jpg",
-        }
+        },
+        {"error": "failed"},
     )
 
     assert result == ["https://img.591.com.tw/thumbnail.jpg"]
 
 
-@pytest.mark.asyncio
-async def test_listing_images_reuses_ai_loaded_album(monkeypatch):
-    detail_crawl = MagicMock()
-    monkeypatch.setattr(bot, "crawl_rent_details", detail_crawl)
-
-    result = await _listing_images(
-        {"images": ["https://img.591.com.tw/one.jpg", "https://img.591.com.tw/two.jpg"]}
+def test_listing_images_reuses_ai_loaded_album():
+    result = _listing_images(
+        {
+            "images": [
+                "https://img.591.com.tw/one.jpg",
+                "https://img.591.com.tw/two.jpg",
+            ]
+        },
+        {},
     )
 
     assert result == [
         "https://img.591.com.tw/one.jpg",
         "https://img.591.com.tw/two.jpg",
     ]
-    detail_crawl.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1059,6 +1252,77 @@ async def test_run_crawler_retries_telegram(bot_harness, monkeypatch):
     assert result == summary
     sleep.assert_awaited_once_with(0.25)
     assert bot_harness.application.bot.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_sends_location_when_address_geocodes(
+    bot_harness, monkeypatch
+):
+    bot_harness.store.toggle_region(3)
+    summary = {"regions": []}
+
+    async def fake_crawl(config_path, notify):
+        await notify(
+            "台北市",
+            {
+                "id": "21713336",
+                "title": "Listing",
+                "price": "39,000元/月",
+                "location": "中山區-新生北路三段",
+                "url": "https://rent.591.com.tw/21713336",
+            },
+        )
+        return summary
+
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+    monkeypatch.setattr(
+        bot,
+        "_listing_detail",
+        AsyncMock(return_value={"address": "中山區新生北路三段84巷"}),
+    )
+    monkeypatch.setattr(
+        bot, "_geocode_address", lambda query, timeout=10: (25.06, 121.53)
+    )
+    bot_harness.application.bot.send_message.return_value = SimpleNamespace(
+        message_id=1
+    )
+
+    assert await bot._run_crawler(bot_harness.application) == summary
+
+    bot_harness.application.bot.send_location.assert_awaited_once_with(
+        chat_id=123, latitude=25.06, longitude=121.53
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_skips_location_without_geocoded_address(
+    bot_harness, monkeypatch
+):
+    bot_harness.store.toggle_region(3)
+    summary = {"regions": []}
+
+    async def fake_crawl(config_path, notify):
+        await notify(
+            "台北市",
+            {
+                "id": "21713336",
+                "title": "Listing",
+                "price": "39,000元/月",
+                "location": "中山區-新生北路三段",
+                "url": "https://rent.591.com.tw/21713336",
+            },
+        )
+        return summary
+
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+    monkeypatch.setattr(bot, "_listing_detail", AsyncMock(return_value={}))
+    bot_harness.application.bot.send_message.return_value = SimpleNamespace(
+        message_id=1
+    )
+
+    assert await bot._run_crawler(bot_harness.application) == summary
+
+    bot_harness.application.bot.send_location.assert_not_awaited()
 
 
 @pytest.mark.asyncio

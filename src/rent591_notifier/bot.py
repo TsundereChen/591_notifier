@@ -5,9 +5,12 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import requests
 from apscheduler.triggers.cron import CronTrigger
 from telegram import (
     BotCommand,
@@ -77,6 +80,14 @@ PRICE_PRESETS = {
 PRICE_STEP = 5000
 DEFAULT_PRICE_MAX = 50000
 MAX_IMAGES_PER_LISTING = 10
+TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_CAPTION_LIMIT = 1024
+DETAIL_GROUP_EMOJI = {
+    "基礎資料": "📐",
+    "房屋價格": "💵",
+}
+# Already shown via the tags/labels line; redundant inside 基礎資料.
+EXCLUDED_DETAIL_KEYS = {"其他特色"}
 
 
 def _redact_sensitive_text(text, sensitive_values=()):
@@ -593,25 +604,114 @@ def reschedule(application):
     )
 
 
-def _listing_message(region, listing):
-    details = " · ".join(
+def _truncate(text, limit):
+    """Shorten text to at most `limit` characters, marking cut text with '…'."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit == 1:
+        return "…"
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _fit_with_trailing_url(body, url, limit):
+    """Fit `body` plus a blank line and trailing `url` within `limit` characters."""
+    max_body = max(0, limit - len(url) - 2)
+    return f"{_truncate(body, max_body)}\n\n{url}"
+
+
+def _fit_caption(text):
+    """Shorten a listing message to fit Telegram's photo caption limit."""
+    if len(text) <= TELEGRAM_CAPTION_LIMIT:
+        return text
+    body, sep, tail = text.rpartition("\n\n")
+    if sep and tail.startswith(("https://", "http://")):
+        return _fit_with_trailing_url(body, tail, TELEGRAM_CAPTION_LIMIT)
+    return _truncate(text, TELEGRAM_CAPTION_LIMIT)
+
+
+def _detail_section_block(title, pairs, emoji=None, exclude=()):
+    """Format a detail label/value group as a bulleted block, e.g. cost breakdown."""
+    items = [
+        f"  • {label}：{value}"
+        for label, value in pairs.items()
+        if value and label not in exclude
+    ]
+    if not items:
+        return None
+    icon = emoji or DETAIL_GROUP_EMOJI.get(title, "📋")
+    return "\n".join([f"{icon} {title}", *items])
+
+
+def _listing_message(region, listing, detail=None):
+    detail = detail or {}
+    lines = []
+
+    lines.append(f"💰 {listing.get('price') or detail.get('price') or ''}")
+
+    location = listing.get("location", "")
+    lines.append(f"📍 {region} {location}".rstrip())
+
+    address = detail.get("address")
+    if address:
+        lines.append(f"🗺 {address}")
+
+    community = detail.get("community") or listing.get("community")
+    if community:
+        lines.append(f"🏘 社區：{community}")
+
+    if detail.get("preferred"):
+        lines.append("⭐ 優選物件")
+
+    spec = " · ".join(
         filter(
             None,
             [
-                listing.get("kind"),
-                listing.get("layout"),
-                listing.get("area"),
-                listing.get("floor"),
+                listing.get("kind") or detail.get("building_type"),
+                detail.get("layout") or listing.get("layout"),
+                detail.get("area") or listing.get("area"),
+                detail.get("floor") or listing.get("floor"),
             ],
         )
     )
-    lines = [
-        f"🏠 {listing.get('title', '新租屋物件')}",
-        f"💰 {listing.get('price', '')}",
-        f"📍 {region} {listing.get('location', '')}",
-    ]
-    if details:
-        lines.append(f"🏢 {details}")
+    if spec:
+        lines.append(f"🏢 {spec}")
+
+    transit = listing.get("nearby_transit")
+    if isinstance(transit, dict) and transit.get("text"):
+        icon = "🚇" if transit.get("type") == "metro" else "🚌"
+        lines.append(f"{icon} {transit['text']}")
+
+    all_tags = [*(listing.get("tags") or []), *(detail.get("labels") or [])]
+    tags = [tag for tag in dict.fromkeys(all_tags) if tag]
+    if tags:
+        lines.append(f"🏷 {'、'.join(tags)}")
+
+    for group, pairs in (detail.get("details") or {}).items():
+        block = _detail_section_block(group, pairs, exclude=EXCLUDED_DETAIL_KEYS)
+        if block:
+            lines.append(block)
+
+    rental_block = _detail_section_block("租住說明", detail.get("rental_notes") or {})
+    if rental_block:
+        lines.append(rental_block)
+
+    facilities = detail.get("facilities") or {}
+    if facilities.get("provided"):
+        lines.append(f"🛋 提供設備：{'、'.join(facilities['provided'])}")
+
+    poster = detail.get("poster") or listing.get("poster")
+    if poster:
+        poster_info = str(detail.get("poster_info") or "").strip()
+        lines.append(f"👤 {poster}" + (f"（{poster_info}）" if poster_info else ""))
+
+    freshness = " ・ ".join(
+        filter(None, [listing.get("updated"), listing.get("views")])
+    )
+    if freshness:
+        lines.append(f"🕒 {freshness}")
+
     verdict = listing.get("ai")
     if isinstance(verdict, dict):
         if verdict.get("unavailable"):
@@ -626,9 +726,100 @@ def _listing_message(region, listing):
             reason = str(verdict.get("reason") or "").strip()
             if reason:
                 lines.append(f"💭 {reason}")
-    if listing.get("url"):
-        lines.extend(["", listing["url"]])
-    return "\n".join(lines)
+
+    body = "\n".join(lines)
+    url = listing.get("url")
+    if url:
+        return _fit_with_trailing_url(body, url, TELEGRAM_MESSAGE_LIMIT)
+    return _truncate(body, TELEGRAM_MESSAGE_LIMIT)
+
+
+async def _listing_detail(listing):
+    """Fetch the listing's detail page, or {} if it could not be loaded."""
+    url = listing.get("url")
+    if not url:
+        return {}
+    try:
+        payload = await asyncio.to_thread(crawl_rent_details, url, delay=0)
+        result = json.loads(payload).get("listings")
+        if (
+            not isinstance(result, list)
+            or not result
+            or not isinstance(result[0], dict)
+        ):
+            raise ValueError("detail crawler returned an invalid payload")
+        detail = result[0]
+        if detail.get("error"):
+            raise ValueError(detail["error"])
+        return detail
+    except Exception:
+        LOGGER.warning(
+            "Could not load listing detail page; showing list data only listing_id=%s",
+            listing.get("id", "unknown"),
+            exc_info=True,
+        )
+        return {}
+
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_USER_AGENT = "591-notifier (https://github.com/TsundereChen/591_notifier)"
+NOMINATIM_MIN_INTERVAL_S = 1.0  # Nominatim's usage policy caps requests at 1/s.
+# OSM rarely indexes Taiwan's alley/lane/number suffixes, so progressively drop
+# them and retry at road level rather than giving up on the whole address.
+ADDRESS_TAIL_PATTERN = re.compile(r"(\d+號|\d+之\d+|\d+弄|\d+巷)$")
+_geocode_lock = threading.Lock()
+_last_geocode_call = 0.0
+
+
+def _geocode_address_once(query, timeout=10):
+    """Send one rate-limited Nominatim lookup and return its top result, or None."""
+    global _last_geocode_call
+    with _geocode_lock:
+        wait = _last_geocode_call + NOMINATIM_MIN_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            resp = requests.get(
+                NOMINATIM_URL,
+                params={"q": query, "format": "json", "limit": 1},
+                headers={"User-Agent": NOMINATIM_USER_AGENT},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            results = resp.json()
+        except (requests.RequestException, ValueError):
+            LOGGER.warning("Could not geocode address query=%s", query, exc_info=True)
+            return None
+        finally:
+            _last_geocode_call = time.monotonic()
+    if not isinstance(results, list) or not results:
+        return None
+    try:
+        return float(results[0]["lat"]), float(results[0]["lon"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _geocode_address(query, timeout=10):
+    """Geocode an address, retrying at road level if the exact address has no match."""
+    seen = set()
+    current = query
+    while current and current not in seen:
+        seen.add(current)
+        coordinates = _geocode_address_once(current, timeout=timeout)
+        if coordinates is not None:
+            return coordinates
+        current = ADDRESS_TAIL_PATTERN.sub("", current)
+    return None
+
+
+async def _listing_coordinates(region, detail):
+    """Resolve a listing's detail-page address to (latitude, longitude), or None."""
+    address = detail.get("address")
+    if not address:
+        return None
+    query = address if address.startswith(region) else f"{region}{address}"
+    return await asyncio.to_thread(_geocode_address, query)
 
 
 def _usable_image_urls(values):
@@ -646,44 +837,24 @@ def _usable_image_urls(values):
     return images
 
 
-async def _listing_images(listing):
-    """Load the listing's detail-page album, falling back to its thumbnail."""
+def _listing_images(listing, detail):
+    """Return the listing's detail-page album, falling back to its thumbnail."""
     preloaded = _usable_image_urls(listing.get("images") or [])
     if preloaded:
         return preloaded
     fallback = _usable_image_urls([listing.get("image")])
-    url = listing.get("url")
-    if not url:
+    images = detail.get("images")
+    if not isinstance(images, list):
         return fallback
-
-    try:
-        payload = await asyncio.to_thread(crawl_rent_details, url, delay=0)
-        details = json.loads(payload)
-        result = details.get("listings")
-        if (
-            not isinstance(result, list)
-            or not result
-            or not isinstance(result[0], dict)
-        ):
-            raise ValueError("detail crawler returned an invalid payload")
-        images = result[0].get("images")
-        if not isinstance(images, list):
-            return fallback
-        return _usable_image_urls(images) or fallback
-    except Exception:
-        LOGGER.warning(
-            "Could not load detail-page images; using thumbnail listing_id=%s",
-            listing.get("id", "unknown"),
-            exc_info=True,
-        )
-        return fallback
+    return _usable_image_urls(images) or fallback
 
 
 async def _send_listing(bot, chat_id, text, images, *, listing_id="unknown"):
     """Send one listing as a photo, album, or text-only fallback."""
+    caption = _fit_caption(text)
     if len(images) > 1:
         media = [
-            InputMediaPhoto(media=image, caption=text if index == 0 else None)
+            InputMediaPhoto(media=image, caption=caption if index == 0 else None)
             for index, image in enumerate(images[:MAX_IMAGES_PER_LISTING])
         ]
         try:
@@ -697,7 +868,9 @@ async def _send_listing(bot, chat_id, text, images, *, listing_id="unknown"):
             )
     if images:
         try:
-            return await bot.send_photo(chat_id=chat_id, photo=images[0], caption=text)
+            return await bot.send_photo(
+                chat_id=chat_id, photo=images[0], caption=caption
+            )
         except BadRequest as exc:
             LOGGER.warning(
                 "Telegram rejected listing photo; falling back to text listing_id=%s "
@@ -889,9 +1062,11 @@ async def _run_crawler(application, status_chat_id=None):
                 return True
 
     async def notify(region, listing):
-        text = _listing_message(region, listing)
-        images = await _listing_images(listing)
+        detail = await _listing_detail(listing)
+        text = _listing_message(region, listing, detail)
+        images = _listing_images(listing, detail)
         listing["images"] = images
+        coordinates = await _listing_coordinates(region, detail)
         for attempt in range(3):
             try:
                 message = await _send_listing(
@@ -901,6 +1076,20 @@ async def _run_crawler(application, status_chat_id=None):
                     images,
                     listing_id=listing.get("id", "unknown"),
                 )
+                if coordinates is not None:
+                    try:
+                        await application.bot.send_location(
+                            chat_id=chat_id,
+                            latitude=coordinates[0],
+                            longitude=coordinates[1],
+                        )
+                    except Exception:
+                        LOGGER.warning(
+                            "Could not send listing location region=%s listing_id=%s",
+                            region,
+                            listing.get("id", "unknown"),
+                            exc_info=True,
+                        )
                 return {"chat_id": chat_id, "message_id": message.message_id}
             except RetryAfter as exc:
                 if attempt == 2:
