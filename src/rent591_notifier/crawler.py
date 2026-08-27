@@ -874,8 +874,23 @@ def crawl_rent_list(
         )
     if not cards:
         page_text = soup.get_text(" ", strip=True)
-        empty_markers = ("查無符合", "沒有符合", "暫無符合", "沒有相關物件")
-        if not any(marker in page_text for marker in empty_markers):
+        # 591's "no matching listings" state. The Nuxt site renders
+        # "很抱歉，暫時沒有為您找到合適的物件 / 建議您重新搜尋試試看唷" plus a
+        # house/notfound.*.png image; older markup used the shorter phrases.
+        empty_markers = (
+            "很抱歉",
+            "暫時沒有為您找到合適的物件",
+            "建議您重新搜尋",
+            "查無符合",
+            "沒有符合",
+            "暫無符合",
+            "沒有相關物件",
+        )
+        empty_result = any(marker in page_text for marker in empty_markers) or (
+            container.select_one("img[src*='notfound']") is not None
+        )
+        page_number = int(page) if page is not None else 1
+        if not empty_result and page_number <= 1:
             LOGGER.error(
                 "591 list page was empty without an expected empty marker region=%s "
                 "page=%s url=%s response_chars=%s",
@@ -886,6 +901,19 @@ def crawl_rent_list(
             )
             raise CrawlerParseError(
                 "listing container had no cards and no recognized empty-result message"
+            )
+        if not empty_result:
+            # A later page with an empty listing container but no empty marker:
+            # the earlier pages already validated the markup, so this is end of
+            # results or a transient 591 hiccup (seen during 591's nightly
+            # listing expiry) rather than a parse failure. Treat it as empty.
+            LOGGER.warning(
+                "591 list page %s was empty without an empty marker; treating as "
+                "end of results region=%s url=%s response_chars=%s",
+                page,
+                REGIONS[region_id],
+                url,
+                len(resp.text),
             )
 
     LOGGER.info(

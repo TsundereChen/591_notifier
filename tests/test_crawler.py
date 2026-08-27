@@ -409,6 +409,47 @@ class TestCrawlRentList:
         ):
             crawl_rent_list()
 
+    def test_current_nuxt_empty_result_page_is_accepted(self):
+        # The live 591 Nuxt "no matches" page: .list-wrapper present, zero
+        # cards, and a 很抱歉 / notfound.png empty state (none of the legacy
+        # 查無符合-style phrases).
+        html = (
+            "<html><body><div class='list-wrapper'><main>"
+            "<img src='//s.591.com.tw/house/notfound.CqB1BTBl.png'>"
+            "<h3>很抱歉，暫時沒有為您找到合適的物件</h3>"
+            "<p>建議您重新搜尋試試看唷～</p>"
+            "</main></div></body></html>"
+        )
+        with mock.patch(
+            "rent591_notifier.crawler._http_get", return_value=_mock_response(html)
+        ):
+            result = json.loads(crawl_rent_list())
+        assert result["count"] == 0
+        assert result["listings"] == []
+
+    def test_empty_later_page_without_marker_is_treated_as_end_of_results(self):
+        # 591 occasionally serves an empty .list-wrapper with no empty marker
+        # for an out-of-range / transiently-empty page. Earlier pages already
+        # validated the markup, so this must not abort the crawl.
+        html = "<html><body><div class='list-wrapper'><main></main></div></body></html>"
+        with mock.patch(
+            "rent591_notifier.crawler._http_get", return_value=_mock_response(html)
+        ):
+            result = json.loads(crawl_rent_list(page=5))
+        assert result["count"] == 0
+        assert result["listings"] == []
+
+    def test_empty_first_page_without_any_marker_still_raises(self):
+        html = "<html><body><div class='list-wrapper'><main></main></div></body></html>"
+        with (
+            mock.patch(
+                "rent591_notifier.crawler._http_get",
+                return_value=_mock_response(html),
+            ),
+            pytest.raises(CrawlerParseError, match="empty-result message"),
+        ):
+            crawl_rent_list(page=1)
+
     def test_one_malformed_card_does_not_discard_valid_cards(self):
         html = FIXTURE_HTML.replace(
             '<div class="item" data-id="21803880">',
