@@ -332,6 +332,34 @@ async def test_listing_coordinates_returns_none_without_address():
     assert await bot._listing_coordinates("台北市", {}) is None
 
 
+@pytest.mark.asyncio
+async def test_listing_coordinates_prefers_embedded_position(monkeypatch):
+    def fail(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("geocoder should not run when 591 supplies coordinates")
+
+    monkeypatch.setattr(bot, "_geocode_address", fail)
+
+    result = await bot._listing_coordinates(
+        "新北市",
+        {"address": "板橋區中山路二段332號", "lat": 25.0190259, "lng": 121.480198},
+    )
+
+    assert result == (25.0190259, 121.480198)
+
+
+@pytest.mark.asyncio
+async def test_listing_coordinates_geocodes_when_position_incomplete(monkeypatch):
+    monkeypatch.setattr(
+        bot, "_geocode_address", lambda query, timeout=10: (25.06, 121.53)
+    )
+
+    result = await bot._listing_coordinates(
+        "台北市", {"address": "中山區新生北路三段84巷", "lat": 25.06, "lng": None}
+    )
+
+    assert result == (25.06, 121.53)
+
+
 def test_geocode_address_parses_first_result(monkeypatch):
     monkeypatch.setattr(bot, "_last_geocode_call", 0.0)
     response = MagicMock()
@@ -1291,6 +1319,54 @@ async def test_run_crawler_sends_location_when_address_geocodes(
 
     bot_harness.application.bot.send_location.assert_awaited_once_with(
         chat_id=123, latitude=25.06, longitude=121.53
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_crawler_sends_embedded_location_without_geocoding(
+    bot_harness, monkeypatch
+):
+    bot_harness.store.toggle_region(3)
+    summary = {"regions": []}
+
+    async def fake_crawl(config_path, notify):
+        await notify(
+            "新北市",
+            {
+                "id": "21858213",
+                "title": "Listing",
+                "price": "18,000元/月",
+                "location": "板橋區-中山路二段",
+                "url": "https://rent.591.com.tw/21858213",
+            },
+        )
+        return summary
+
+    monkeypatch.setattr(bot, "crawl_and_notify", fake_crawl)
+    monkeypatch.setattr(
+        bot,
+        "_listing_detail",
+        AsyncMock(
+            return_value={
+                "address": "板橋區中山路二段332號",
+                "lat": 25.0190259,
+                "lng": 121.480198,
+            }
+        ),
+    )
+
+    def fail(*args, **kwargs):  # pragma: no cover - must not be called
+        raise AssertionError("geocoder should not run for embedded coordinates")
+
+    monkeypatch.setattr(bot, "_geocode_address", fail)
+    bot_harness.application.bot.send_message.return_value = SimpleNamespace(
+        message_id=1
+    )
+
+    assert await bot._run_crawler(bot_harness.application) == summary
+
+    bot_harness.application.bot.send_location.assert_awaited_once_with(
+        chat_id=123, latitude=25.0190259, longitude=121.480198
     )
 
 

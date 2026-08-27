@@ -814,7 +814,11 @@ def _geocode_address(query, timeout=10):
 
 
 async def _listing_coordinates(region, detail):
-    """Resolve a listing's detail-page address to (latitude, longitude), or None."""
+    """Resolve a listing to (latitude, longitude): 591's own map coordinates when
+    the detail page embedded them, otherwise a geocode of its address, or None."""
+    lat, lng = detail.get("lat"), detail.get("lng")
+    if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+        return float(lat), float(lng)
     address = detail.get("address")
     if not address:
         return None

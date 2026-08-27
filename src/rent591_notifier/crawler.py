@@ -974,6 +974,146 @@ def _structured_album_images(soup):
     return max(candidates, key=len, default=[])
 
 
+# 591 keeps the map coordinates in its Nuxt payload rather than the DOM. The
+# payload is a minified IIFE of the form
+#   window.__NUXT__=(function(a,b,c,...){...positionRound:{...,lat:X,lng:Y,...}...
+#   }(0,"",1,...));
+# where X and Y are either numeric literals or single-letter parameter names
+# bound positionally to entries in the trailing argument list.
+_NUXT_ASSIGN_RE = re.compile(r"window\.__NUXT__\s*=\s*")
+_POSITION_REF_RE = re.compile(r"positionRound:\{[^{}]*?lat:([-\w$.]+),lng:([-\w$.]+)")
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _nuxt_iife(soup):
+    """Return the raw `window.__NUXT__` assignment right-hand side, or None."""
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text() or ""
+        match = _NUXT_ASSIGN_RE.search(text)
+        if match:
+            return text[match.end() :]
+    return None
+
+
+def _scan_block(text, start):
+    """Given text[start] is an opening bracket, return the index just past its
+    match, skipping bracket characters that appear inside string literals."""
+    pairs = {"(": ")", "{": "}", "[": "]"}
+    opener = text[start]
+    closer = pairs[opener]
+    depth = 0
+    quote = ""
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'`":
+            quote = ch
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise ValueError("unbalanced block in Nuxt payload")
+
+
+def _split_top_level_args(text):
+    """Split a JS argument list on top-level commas, honoring string literals."""
+    parts = []
+    depth = 0
+    quote = ""
+    buf = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'`":
+            quote = ch
+            buf.append(ch)
+        elif ch in "([{":
+            depth += 1
+            buf.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _nuxt_position(soup):
+    """Extract the listing's map coordinates from the Nuxt payload, or None."""
+    src = _nuxt_iife(soup)
+    if not src:
+        return None
+    ref_match = _POSITION_REF_RE.search(src)
+    if not ref_match:
+        return None
+    lat_ref, lng_ref = ref_match.groups()
+    try:
+        params_open = src.index("(", src.index("function"))
+        params_close = _scan_block(src, params_open)
+        params = [p.strip() for p in src[params_open + 1 : params_close - 1].split(",")]
+        body_open = src.index("{", params_close)
+        body_close = _scan_block(src, body_open)
+        args_open = src.index("(", body_close)
+        args_close = _scan_block(src, args_open)
+        args = _split_top_level_args(src[args_open + 1 : args_close - 1])
+    except (ValueError, IndexError):
+        LOGGER.debug("Could not parse Nuxt IIFE for map coordinates", exc_info=True)
+        return None
+    # An IIFE binds exactly one argument per parameter; any mismatch means the
+    # split above went wrong and every positional binding is suspect, so bail
+    # rather than risk pinning the listing at some other value's coordinates.
+    if len(params) != len(args):
+        LOGGER.debug(
+            "Nuxt IIFE param/arg count mismatch (%s vs %s); skipping coordinates",
+            len(params),
+            len(args),
+        )
+        return None
+    bindings = dict(zip(params, (a.strip() for a in args)))
+
+    def resolve(ref):
+        raw = ref if _NUMBER_RE.fullmatch(ref) else bindings.get(ref, "")
+        raw = raw.strip().strip('"')
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    lat, lng = resolve(lat_ref), resolve(lng_ref)
+    if lat is None or lng is None:
+        LOGGER.debug("Nuxt payload had positionRound but no usable lat/lng")
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+        return None
+    # 591 stores 0/0 for listings it has not geocoded yet (common for brand-new
+    # posts); treat that sentinel as "no coordinates" rather than Null Island.
+    if abs(lat) < 1.0 or abs(lng) < 1.0:
+        return None
+    return lat, lng
+
+
 def _parse_detail(soup, url):
     """Parse one rent detail page into a dict."""
     detail = {"url": url}
@@ -1003,6 +1143,11 @@ def _parse_detail(soup, url):
     detail["price_value"] = int(num) if num.isdigit() else None
 
     detail["address"] = _text(soup.select_one("div.address span.load-map"))
+
+    # 591's map popup pins the listing with coordinates from the Nuxt payload;
+    # these are far more precise than geocoding the road-level address string.
+    position = _nuxt_position(soup)
+    detail["lat"], detail["lng"] = position if position else (None, None)
 
     # Parse `房屋詳情` label/value groups such as `基礎資料` and `房屋價格`.
     details = {}

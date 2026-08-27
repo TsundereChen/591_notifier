@@ -24,6 +24,7 @@ from rent591_notifier.crawler import (
     CrawlerParseError,
     _CompatibilityTLSAdapter,
     _http_get,
+    _nuxt_position,
     _parse_detail,
     _parse_item,
     _parse_spec,
@@ -471,6 +472,17 @@ class TestParseDetail:
     def test_address(self):
         assert self._parse()["address"] == "土城區中央路四段125巷"
 
+    def test_coordinates_from_nuxt_payload(self):
+        d = self._parse()
+        assert d["lat"] == 24.9629123
+        assert d["lng"] == 121.4457889
+
+    def test_coordinates_absent_when_page_has_no_nuxt_payload(self):
+        soup = BeautifulSoup('<section class="info-board"></section>', "html.parser")
+        d = _parse_detail(soup, "https://rent.591.com.tw/123")
+        assert d["lat"] is None
+        assert d["lng"] is None
+
     def test_detail_sections(self):
         d = self._parse()
         assert d["details"]["基礎資料"] == {"電梯": "無", "陽台": "2陽台"}
@@ -529,6 +541,72 @@ class TestParseDetail:
     def test_id_from_unparseable_url_is_none(self):
         d = self._parse(url="https://example.com/foo")
         assert d["id"] is None
+
+
+class TestNuxtPosition:
+    def _soup(self, script):
+        return BeautifulSoup(f"<script>{script}</script>", "html.parser")
+
+    def test_resolves_parameter_references(self):
+        script = (
+            "window.__NUXT__=(function(a,b,c,d){return {x:{positionRound:"
+            "{communityId:a,address:d,lat:b,lng:c,data:[]}}}}(0,25.0190259,"
+            '121.4801980,"板橋區中山路二段332號"));'
+        )
+        assert _nuxt_position(self._soup(script)) == (25.0190259, 121.4801980)
+
+    def test_resolves_dollar_and_underscore_reference_names(self):
+        script = (
+            "window.__NUXT__=(function(a,b$,c_){return {positionRound:"
+            "{communityId:a,address:a,lat:b$,lng:c_,data:[]}}}"
+            "(0,25.0277893,121.4581373));"
+        )
+        assert _nuxt_position(self._soup(script)) == (25.0277893, 121.4581373)
+
+    def test_handles_numeric_literals_inline(self):
+        script = (
+            "window.__NUXT__=(function(a){return {positionRound:"
+            "{address:a,lat:25.03,lng:121.47,data:[]}}}(0));"
+        )
+        assert _nuxt_position(self._soup(script)) == (25.03, 121.47)
+
+    def test_returns_none_without_position_round(self):
+        script = "window.__NUXT__=(function(a){return {house:{id:a}}}(0));"
+        assert _nuxt_position(self._soup(script)) is None
+
+    def test_returns_none_without_nuxt_payload(self):
+        assert _nuxt_position(self._soup("var other = 1;")) is None
+
+    def test_rejects_out_of_range_coordinates(self):
+        script = (
+            "window.__NUXT__=(function(a){return {positionRound:"
+            "{address:a,lat:999,lng:121.47,data:[]}}}(0));"
+        )
+        assert _nuxt_position(self._soup(script)) is None
+
+    def test_ignores_commas_inside_string_arguments(self):
+        script = (
+            "window.__NUXT__=(function(a,b,c,d){return {positionRound:"
+            "{title:d,address:d,lat:b,lng:c,data:[]}}}"
+            '(0,25.05,121.55,"A, B and C"));'
+        )
+        assert _nuxt_position(self._soup(script)) == (25.05, 121.55)
+
+    def test_rejects_param_and_argument_count_mismatch(self):
+        # Four parameters but only three arguments: positional bindings would be
+        # shifted, so extraction must bail even though lat/lng look plausible.
+        script = (
+            "window.__NUXT__=(function(a,b,c,d){return {positionRound:"
+            "{address:d,lat:b,lng:c,data:[]}}}(0,25.05,121.55));"
+        )
+        assert _nuxt_position(self._soup(script)) is None
+
+    def test_tolerates_whitespace_around_assignment(self):
+        script = (
+            "window.__NUXT__ = (function(a){return {positionRound:"
+            "{address:a,lat:25.03,lng:121.47,data:[]}}}(0));"
+        )
+        assert _nuxt_position(self._soup(script)) == (25.03, 121.47)
 
 
 # ---------------------------------------------------------------------------
@@ -619,3 +697,16 @@ class TestLiveSite:
         assert listing["price_value"] > 0
         assert listing["address"]
         assert listing["images"]
+        assert "lat" in listing and "lng" in listing
+
+    def test_detail_page_exposes_map_coordinates(self):
+        # 591 has not geocoded the very newest posts (lat/lng come through as
+        # None), so scan the page until a listing with coordinates turns up.
+        page = json.loads(crawl_rent_list(region="台北市"))
+        for source in page["listings"]:
+            listing = json.loads(crawl_rent_details(source["url"]))["listings"][0]
+            if listing.get("lat") is not None:
+                assert 24.5 < listing["lat"] < 25.3
+                assert 121.3 < listing["lng"] < 121.7
+                return
+        pytest.fail("no listing on the first page exposed map coordinates")
