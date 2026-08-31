@@ -411,12 +411,14 @@ def evaluate_listing(
             continue
         verdict = _parse_verdict(content)
         LOGGER.info(
-            "AI evaluation completed listing_id=%s good=%s score=%s images=%s model=%s",
+            "AI evaluation completed listing_id=%s good=%s score=%s images=%s "
+            "model=%s reason=%r",
             listing.get("id", "unknown"),
             verdict["good"],
             verdict["score"],
             len(image_parts) if with_images else 0,
             model,
+            verdict["reason"],
         )
         return verdict, image_urls
     raise AIModelError("AI provider rejected every request variant") from last_error
